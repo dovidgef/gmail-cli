@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gmail-cli"
+version = "0.1.0"
+description = "Strictly read-only, JSON-first command-line client for Gmail — search, read and inspect mail from a terminal or an AI agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Dovid Gefen" }]
+keywords = [
+    "gmail",
+    "cli",
+    "email",
+    "oauth",
+    "google-api",
+    "read-only",
+    "json",
+    "claude-code",
+    "ai-agents",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "google-auth>=2.29",
+    "google-auth-oauthlib>=1.2",
+    "google-api-python-client>=2.130",
+]
+
+[project.urls]
+Homepage = "https://github.com/dovidgefen/gmail-cli"
+Repository = "https://github.com/dovidgefen/gmail-cli"
+Issues = "https://github.com/dovidgefen/gmail-cli/issues"
+
+[project.scripts]
+gmail-cli = "gmail_cli.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gmail_cli"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/gmail_cli",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+    "tests",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.7",
+    "mypy>=1.11",
+    "pre-commit>=3.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "PL", "RUF"]
+ignore = ["PLR0913", "PLR0912", "PLR0911", "PLR0915", "PLR2004", "E501"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/gmail_cli"]
+ignore_missing_imports = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
