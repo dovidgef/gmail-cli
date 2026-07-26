@@ -12,6 +12,8 @@ no code path here — present or future — can send, label, trash or delete.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import email.utils
 import json
@@ -718,6 +720,109 @@ def message_summary(msg: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def b64url_decode(data: str) -> bytes:
+    """Decode Gmail's base64url payloads, which arrive without padding."""
+    if not data:
+        return b''
+    padded = data + '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded)
+
+
+def decode_text(data: str) -> str:
+    """Decode a base64url body part to text, never raising on bad input."""
+    try:
+        return b64url_decode(data).decode('utf-8', errors='replace')
+    except (binascii.Error, ValueError):
+        return ''
+
+
+def collect_parts(
+    payload: dict[str, Any],
+    texts: list[tuple[str, str]],
+    attachments: list[dict[str, Any]],
+) -> None:
+    """Depth-first walk of a ``format=full`` MIME tree.
+
+    A part with both a filename and an ``attachmentId`` is an attachment, never
+    body content — that is what keeps an attached .txt out of the rendered body.
+    """
+    if not isinstance(payload, dict):
+        return
+    body = payload.get('body') or {}
+    filename = str(payload.get('filename') or '')
+    mime = str(payload.get('mimeType') or '')
+
+    if filename and body.get('attachmentId'):
+        disposition = headers_map(payload).get('content-disposition', '').lower()
+        attachments.append(
+            {
+                'id': body.get('attachmentId'),
+                'name': filename,
+                'contentType': mime,
+                'size': body.get('size', 0),
+                'isInline': 'inline' in disposition,
+            }
+        )
+        return
+
+    parts = payload.get('parts')
+    if parts:
+        for part in parts:
+            collect_parts(part, texts, attachments)
+        return
+
+    # Anything that isn't plain text or HTML (calendar invites, signatures,
+    # nested images without a filename) is not body content we can render.
+    if mime in ('text/plain', 'text/html') and body.get('data'):
+        texts.append((mime, decode_text(str(body['data']))))
+
+
+def select_body(texts: list[tuple[str, str]], want: str) -> tuple[str, str]:
+    """Pick the body to return. The reported type is what you *got*, not what you asked for."""
+    plain = '\n'.join(text for mime, text in texts if mime == 'text/plain')
+    html = '\n'.join(text for mime, text in texts if mime == 'text/html')
+    if want == 'html':
+        if html:
+            return 'html', html
+        return 'text', plain
+    if plain:
+        return 'text', plain
+    if html:
+        return 'html', html
+    return 'text', ''
+
+
+def message_full(msg: dict[str, Any], body_type: str, include_headers: bool) -> dict[str, Any]:
+    payload = msg.get('payload') or {}
+    headers = headers_map(payload)
+    texts: list[tuple[str, str]] = []
+    attachments: list[dict[str, Any]] = []
+    collect_parts(payload, texts, attachments)
+    content_type, body = select_body(texts, body_type)
+
+    result = message_summary(msg)
+    result.update(
+        {
+            'bcc': split_addresses(headers.get('bcc', '')),
+            'replyTo': split_addresses(headers.get('reply-to', '')),
+            'messageId': headers.get('message-id', ''),
+            # At format=full the attachment parts are authoritative.
+            'hasAttachments': bool(attachments),
+            'bodyContentType': content_type,
+            'body': body,
+        }
+    )
+    if attachments:
+        result['attachments'] = attachments
+    if include_headers:
+        # A list, not a dict: Received and friends legitimately repeat.
+        result['headers'] = [
+            {'name': h.get('name', ''), 'value': h.get('value', '')}
+            for h in payload.get('headers', []) or []
+        ]
+    return result
+
+
 # --------------------------------------------------------------------------
 # Query construction and listing
 # --------------------------------------------------------------------------
@@ -892,6 +997,86 @@ def cmd_search(args: argparse.Namespace, fmt: str) -> None:
     )
 
 
+def cmd_read(args: argparse.Namespace, fmt: str) -> None:
+    service = gmail_service(fmt)
+    missing = f'No such message: {args.message_id}'
+
+    if args.raw or args.save_eml:
+        msg = execute(
+            service.users().messages().get(userId='me', id=args.message_id, format='raw'),
+            fmt,
+            not_found=missing,
+        )
+        try:
+            raw_bytes = b64url_decode(str(msg.get('raw', '')))
+        except (binascii.Error, ValueError) as exc:
+            fail(f'Could not decode the raw message: {exc}', fmt)
+
+        if args.save_eml:
+            path = Path(args.save_eml).expanduser()
+            if path.is_dir():
+                path = path / f'{args.message_id}.eml'
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(raw_bytes)
+            except OSError as exc:
+                fail(f'Could not write {path}: {exc}', fmt)
+            emit(
+                {
+                    'status': 'saved',
+                    'path': str(path),
+                    'size': len(raw_bytes),
+                    'id': msg.get('id'),
+                    'threadId': msg.get('threadId'),
+                },
+                fmt,
+            )
+            return
+
+        emit(
+            {
+                'id': msg.get('id'),
+                'threadId': msg.get('threadId'),
+                'raw': raw_bytes.decode('utf-8', errors='replace'),
+            },
+            fmt,
+        )
+        return
+
+    msg = execute(
+        service.users().messages().get(userId='me', id=args.message_id, format='full'),
+        fmt,
+        not_found=missing,
+    )
+    emit(message_full(msg, args.body_type, args.headers), fmt)
+
+
+def cmd_thread(args: argparse.Namespace, fmt: str) -> None:
+    service = gmail_service(fmt)
+    thread = execute(
+        service.users()
+        .threads()
+        .get(
+            userId='me',
+            id=args.thread_id,
+            format='metadata',
+            metadataHeaders=_SUMMARY_HEADERS,
+        ),
+        fmt,
+        not_found=f'No such thread: {args.thread_id}',
+    )
+    summaries = [message_summary(msg) for msg in thread.get('messages', []) or []]
+    emit(
+        {
+            'id': thread.get('id'),
+            'historyId': thread.get('historyId'),
+            'messages': summaries,
+            'count': len(summaries),
+        },
+        fmt,
+    )
+
+
 def cmd_configure(args: argparse.Namespace, fmt: str) -> None:
     config = load_config()
     if args.credentials:
@@ -984,6 +1169,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_filter_args(p_search)
 
+    p_read = sub.add_parser('read', help='Read one message, body included.')
+    p_read.add_argument('message_id', metavar='MESSAGE_ID')
+    p_read.add_argument(
+        '--body-type',
+        choices=('text', 'html'),
+        default='text',
+        help='Preferred body flavour; falls back to the other when absent (text).',
+    )
+    p_read.add_argument('--headers', action='store_true', help='Include every header, verbatim.')
+    p_read.add_argument('--raw', action='store_true', help='Return the RFC822 source instead.')
+    p_read.add_argument(
+        '--save-eml', metavar='PATH', help='Write the RFC822 source to PATH (or PATH/<id>.eml).'
+    )
+
+    p_thread = sub.add_parser('thread', help='Summarize every message in a thread.')
+    p_thread.add_argument('thread_id', metavar='THREAD_ID')
+
     return parser
 
 
@@ -1023,6 +1225,8 @@ def main(argv: list[str] | None = None) -> int:
         'labels': cmd_labels,
         'list': cmd_list,
         'search': cmd_search,
+        'read': cmd_read,
+        'thread': cmd_thread,
     }
     handler = handlers.get(args.command)
     if handler is None:
