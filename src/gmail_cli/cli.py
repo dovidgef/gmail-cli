@@ -1077,6 +1077,72 @@ def cmd_thread(args: argparse.Namespace, fmt: str) -> None:
     )
 
 
+def sanitize_filename(name: str) -> str:
+    """Reduce an attachment's declared filename to a safe basename.
+
+    A hostile (or merely sloppy) sender controls this string, so strip anything
+    that could escape the directory the user asked to write into.
+    """
+    candidate = name.replace('\\', '/').split('/')[-1].replace('\x00', '').strip()
+    return '' if candidate in ('', '.', '..') else candidate
+
+
+def attachment_filename(service: Any, message_id: str, attachment_id: str, fmt: str) -> str:
+    """Look up the part's real filename. Costs one extra ``messages.get``."""
+    msg = execute(
+        service.users().messages().get(userId='me', id=message_id, format='full'),
+        fmt,
+        not_found=f'No such message: {message_id}',
+    )
+    texts: list[tuple[str, str]] = []
+    attachments: list[dict[str, Any]] = []
+    collect_parts(msg.get('payload') or {}, texts, attachments)
+    for att in attachments:
+        if str(att.get('id')) == attachment_id:
+            return sanitize_filename(str(att.get('name') or ''))
+    return ''
+
+
+def cmd_attachment(args: argparse.Namespace, fmt: str) -> None:
+    service = gmail_service(fmt)
+    att = execute(
+        service.users()
+        .messages()
+        .attachments()
+        .get(userId='me', messageId=args.message_id, id=args.attachment_id),
+        fmt,
+        not_found=f'No such attachment {args.attachment_id} on message {args.message_id}',
+    )
+
+    if not args.save:
+        emit(
+            {
+                'id': args.attachment_id,
+                'size': att.get('size', 0),
+                'hint': 'Re-run with --save PATH (a file or a directory) to write the bytes.',
+            },
+            fmt,
+        )
+        return
+
+    try:
+        payload = b64url_decode(str(att.get('data', '')))
+    except (binascii.Error, ValueError) as exc:
+        fail(f'Could not decode the attachment: {exc}', fmt)
+
+    target = Path(args.save).expanduser()
+    if target.is_dir() or args.save.endswith(('/', os.sep)):
+        name = attachment_filename(service, args.message_id, args.attachment_id, fmt)
+        target = target / (name or f'attachment_{args.attachment_id[:12]}')
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+    except OSError as exc:
+        fail(f'Could not write {target}: {exc}', fmt)
+
+    emit({'status': 'saved', 'path': str(target), 'size': len(payload)}, fmt)
+
+
 def cmd_configure(args: argparse.Namespace, fmt: str) -> None:
     config = load_config()
     if args.credentials:
@@ -1186,6 +1252,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_thread = sub.add_parser('thread', help='Summarize every message in a thread.')
     p_thread.add_argument('thread_id', metavar='THREAD_ID')
 
+    p_attachment = sub.add_parser('attachment', help='Inspect or download an attachment.')
+    p_attachment.add_argument('message_id', metavar='MSG_ID')
+    p_attachment.add_argument('attachment_id', metavar='ATT_ID')
+    p_attachment.add_argument(
+        '--save',
+        metavar='PATH',
+        help='Write to PATH. A directory (or trailing /) keeps the sender-supplied filename.',
+    )
+
     return parser
 
 
@@ -1227,6 +1302,7 @@ def main(argv: list[str] | None = None) -> int:
         'search': cmd_search,
         'read': cmd_read,
         'thread': cmd_thread,
+        'attachment': cmd_attachment,
     }
     handler = handlers.get(args.command)
     if handler is None:
