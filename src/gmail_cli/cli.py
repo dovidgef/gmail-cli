@@ -15,7 +15,9 @@ import argparse
 import contextlib
 import json
 import os
+import random
 import sys
+import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +29,8 @@ try:
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build as build_service
+    from googleapiclient.errors import HttpError
 
     _IMPORT_ERROR: str | None = None
 except ImportError as exc:  # pragma: no cover - exercised only on a broken install
@@ -547,8 +551,109 @@ def cmd_logout(args: argparse.Namespace, fmt: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# API client
+# --------------------------------------------------------------------------
+
+_RETRY_ATTEMPTS = 5
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRY_REASONS = frozenset({'rateLimitExceeded', 'userRateLimitExceeded'})
+
+
+def gmail_service(fmt: str) -> Any:
+    creds = get_credentials(fmt)
+    return build_service('gmail', 'v1', credentials=creds, cache_discovery=False)
+
+
+def _error_body(exc: HttpError) -> dict[str, Any]:
+    try:
+        body = json.loads(exc.content.decode('utf-8', errors='replace'))
+    except (AttributeError, ValueError):
+        return {}
+    error = body.get('error') if isinstance(body, dict) else None
+    return error if isinstance(error, dict) else {}
+
+
+def _error_reason(exc: HttpError) -> str:
+    errors = _error_body(exc).get('errors') or []
+    if errors and isinstance(errors[0], dict):
+        return str(errors[0].get('reason', ''))
+    return str(_error_body(exc).get('status', ''))
+
+
+def _error_message(exc: HttpError) -> str:
+    message = _error_body(exc).get('message')
+    return str(message) if message else str(exc)
+
+
+def _is_retryable(exc: HttpError, status: int | None) -> bool:
+    if status in _RETRY_STATUSES:
+        return True
+    # Gmail signals per-user rate limiting as a 403 with a specific reason;
+    # every other 403 (scope, disabled API) is permanent and must not be retried.
+    return status == 403 and _error_reason(exc) in _RETRY_REASONS
+
+
+def execute(request: Any, fmt: str, *, not_found: str | None = None) -> Any:
+    """Run an API request with exponential backoff, and never raise a traceback."""
+    delay = 1.0
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = exc.resp.status if exc.resp is not None else None
+            if status == 404 and not_found is not None:
+                fail(not_found, fmt, status=404)
+            if attempt == _RETRY_ATTEMPTS - 1 or not _is_retryable(exc, status):
+                fail(_error_message(exc), fmt, status=status)
+            time.sleep(delay + random.uniform(0, delay / 2))
+            delay *= 2
+        except Exception as exc:
+            # Transport-level failure (DNS, TLS, connection reset). Not retried —
+            # report it cleanly instead of dumping a stack trace into the JSON stream.
+            fail(f'Request failed: {exc}', fmt)
+    raise AssertionError('unreachable')  # pragma: no cover
+
+
+def resolve_label_id(service: Any, name: str, fmt: str) -> str:
+    """Map a label *name* to its id (case-insensitive exact match).
+
+    Querying by id rather than ``label:`` in the search string means nested
+    ("Work/Invoices") and spaced label names need no quoting or escaping.
+    """
+    labels = execute(service.users().labels().list(userId='me'), fmt).get('labels', [])
+    wanted = name.strip().lower()
+    for label in labels:
+        if str(label.get('name', '')).lower() == wanted:
+            return str(label.get('id'))
+    near = [
+        str(label.get('name')) for label in labels if wanted in str(label.get('name', '')).lower()
+    ]
+    fail(f'Unknown label: {name}', fmt, didYouMean=near[:5])
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
+
+
+def cmd_profile(args: argparse.Namespace, fmt: str) -> None:
+    service = gmail_service(fmt)
+    profile = execute(service.users().getProfile(userId='me'), fmt)
+    emit(
+        {
+            'emailAddress': profile.get('emailAddress'),
+            'messagesTotal': profile.get('messagesTotal'),
+            'threadsTotal': profile.get('threadsTotal'),
+            'historyId': profile.get('historyId'),
+        },
+        fmt,
+    )
+
+
+def cmd_labels(args: argparse.Namespace, fmt: str) -> None:
+    service = gmail_service(fmt)
+    labels = execute(service.users().labels().list(userId='me'), fmt).get('labels', [])
+    emit({'labels': labels, 'count': len(labels)}, fmt)
 
 
 def cmd_configure(args: argparse.Namespace, fmt: str) -> None:
@@ -625,6 +730,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser('logout', help='Delete the cached token (does not revoke server-side).')
+    sub.add_parser('profile', help='Show the authorized account and its message/thread totals.')
+    sub.add_parser('labels', help='List all labels with their ids.')
 
     return parser
 
@@ -643,6 +750,8 @@ def main(argv: list[str] | None = None) -> int:
         'configure': cmd_configure,
         'login': cmd_login,
         'logout': cmd_logout,
+        'profile': cmd_profile,
+        'labels': cmd_labels,
     }
     handler = handlers.get(args.command)
     if handler is None:
