@@ -52,9 +52,15 @@ gmail-cli = "gmail_cli.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/gmail_cli"]
 
+# Ship the canonical Claude Code skill inside the wheel so
+# `gmail-cli install-skill` can write it out for pip-only users.
+[tool.hatch.build.targets.wheel.force-include]
+".claude/skills/gmail-cli/SKILL.md" = "gmail_cli/_skill/SKILL.md"
+
 [tool.hatch.build.targets.sdist]
 include = [
     "src/gmail_cli",
+    ".claude/skills/gmail-cli/SKILL.md",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

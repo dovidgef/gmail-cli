@@ -23,6 +23,7 @@ import sys
 import time
 import urllib.parse
 from datetime import datetime, timezone
+from importlib import resources
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -47,6 +48,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 
 _STATE_DIR_NAME = '.gmail-cli'
+_SKILL_NAME = 'gmail-cli'
 _INSTALL_HINT = (
     'Missing dependencies. Install with: '
     'uv tool install gmail-cli  (or: pip install google-auth google-auth-oauthlib '
@@ -1182,6 +1184,68 @@ def cmd_history(args: argparse.Namespace, fmt: str) -> None:
     emit(result, fmt)
 
 
+def bundled_skill_text() -> str | None:
+    """Return the packaged SKILL.md, or None if this install doesn't carry one.
+
+    The wheel build copies ``.claude/skills/gmail-cli/SKILL.md`` to
+    ``gmail_cli/_skill/SKILL.md``. Editable installs and `uv run` have no such
+    copy, so fall back to walking up from this file to the in-repo original.
+    """
+    try:
+        bundled = resources.files('gmail_cli').joinpath('_skill/SKILL.md')
+        if bundled.is_file():
+            return bundled.read_text(encoding='utf-8')
+    except (FileNotFoundError, ModuleNotFoundError, AttributeError, OSError):
+        pass
+
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / '.claude' / 'skills' / _SKILL_NAME / 'SKILL.md'
+        if candidate.is_file():
+            return candidate.read_text(encoding='utf-8')
+    return None
+
+
+def cmd_install_skill(args: argparse.Namespace, fmt: str) -> None:
+    text = bundled_skill_text()
+    if text is None:
+        fail(
+            'SKILL.md is not present in this install. Reinstall with: '
+            'uv tool install --force gmail-cli',
+            fmt,
+        )
+
+    if args.target:
+        skills_dir = Path(args.target).expanduser()
+        scope = 'custom'
+    elif args.scope == 'user':
+        skills_dir = Path.home() / '.claude' / 'skills'
+        scope = 'user'
+    else:
+        skills_dir = Path.cwd() / '.claude' / 'skills'
+        scope = 'project'
+
+    dest = skills_dir / _SKILL_NAME / 'SKILL.md'
+    existed = dest.exists()
+    if existed and not args.force:
+        fail(f'{dest} already exists. Re-run with --force to overwrite.', fmt)
+
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding='utf-8')
+    except OSError as exc:
+        fail(f'Could not write {dest}: {exc}', fmt)
+
+    emit(
+        {
+            'path': str(dest),
+            'scope': scope,
+            'overwritten': existed,
+            'bytes': len(text.encode('utf-8')),
+        },
+        fmt,
+    )
+
+
 def cmd_configure(args: argparse.Namespace, fmt: str) -> None:
     config = load_config()
     if args.credentials:
@@ -1314,6 +1378,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_history.add_argument('--page-token', metavar='TOKEN', help='Continue from a previous page.')
 
+    p_skill = sub.add_parser(
+        'install-skill', help='Write the bundled Claude Code skill into a skills directory.'
+    )
+    p_skill.add_argument(
+        '--scope',
+        choices=('project', 'user'),
+        default='project',
+        help='project -> ./.claude/skills (default); user -> ~/.claude/skills.',
+    )
+    p_skill.add_argument(
+        '--target',
+        metavar='DIR',
+        help='Explicit skills directory; overrides --scope. Writes <DIR>/gmail-cli/SKILL.md.',
+    )
+    p_skill.add_argument(
+        '--force', '-f', action='store_true', help='Overwrite an existing SKILL.md.'
+    )
+
     return parser
 
 
@@ -1357,6 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
         'thread': cmd_thread,
         'attachment': cmd_attachment,
         'history': cmd_history,
+        'install-skill': cmd_install_skill,
     }
     handler = handlers.get(args.command)
     if handler is None:
