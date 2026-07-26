@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import email.utils
 import json
 import os
 import random
 import sys
 import time
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -632,6 +633,199 @@ def resolve_label_id(service: Any, name: str, fmt: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Message shaping
+# --------------------------------------------------------------------------
+
+# Enough for a summary line plus attachment detection at format=metadata.
+_SUMMARY_HEADERS = ['From', 'To', 'Cc', 'Subject', 'Date', 'Content-Disposition']
+
+
+def headers_map(payload: dict[str, Any]) -> dict[str, str]:
+    """Lower-cased header name -> value for one MIME part."""
+    return {
+        str(h.get('name', '')).lower(): str(h.get('value', ''))
+        for h in payload.get('headers', []) or []
+    }
+
+
+def split_addresses(raw: str) -> list[str]:
+    """Split an address header into entries.
+
+    ``email.utils.getaddresses`` is what keeps ``"Doe, Jane" <j@x.com>`` a single
+    entry — a naive ``split(',')`` would tear it in half.
+    """
+    if not raw:
+        return []
+    return [email.utils.formataddr(pair) for pair in email.utils.getaddresses([raw]) if any(pair)]
+
+
+def parse_address(raw: str) -> tuple[str, str]:
+    """Return ``(display_name, email)`` for the first address in a header."""
+    pairs = email.utils.getaddresses([raw]) if raw else []
+    if not pairs:
+        return '', ''
+    name, addr = pairs[0]
+    return name, addr
+
+
+def iso_from_internal_date(value: Any) -> str:
+    """Gmail's ``internalDate`` (ms since epoch) -> ISO-8601 UTC, ``''`` if unusable."""
+    try:
+        millis = int(value)
+    except (TypeError, ValueError):
+        return ''
+    try:
+        return datetime.fromtimestamp(millis / 1000, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return ''
+
+
+def metadata_has_attachments(payload: dict[str, Any]) -> bool:
+    """Walk a ``format=metadata`` MIME tree looking for an attachment part.
+
+    Metadata format omits ``body.attachmentId``, so the only signals available
+    are a non-empty ``filename`` and a ``Content-Disposition: attachment``
+    header. ``read`` at ``format=full`` remains authoritative.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get('filename'):
+        return True
+    disposition = headers_map(payload).get('content-disposition', '')
+    if disposition.strip().lower().startswith('attachment'):
+        return True
+    return any(metadata_has_attachments(part) for part in payload.get('parts') or [])
+
+
+def message_summary(msg: dict[str, Any]) -> dict[str, Any]:
+    payload = msg.get('payload') or {}
+    headers = headers_map(payload)
+    raw_from = headers.get('from', '')
+    from_name, from_email = parse_address(raw_from)
+    return {
+        'id': msg.get('id'),
+        'threadId': msg.get('threadId'),
+        'subject': headers.get('subject') or '(no subject)',
+        'from': raw_from,
+        'fromName': from_name,
+        'fromEmail': from_email,
+        'to': split_addresses(headers.get('to', '')),
+        'cc': split_addresses(headers.get('cc', '')),
+        'date': iso_from_internal_date(msg.get('internalDate')),
+        'labelIds': msg.get('labelIds', []),
+        'hasAttachments': metadata_has_attachments(payload),
+        'snippet': msg.get('snippet', ''),
+    }
+
+
+# --------------------------------------------------------------------------
+# Query construction and listing
+# --------------------------------------------------------------------------
+
+
+def gmail_date(value: str, flag: str, fmt: str) -> str:
+    """Validate ``YYYY-MM-DD`` and rewrite to the ``YYYY/MM/DD`` Gmail expects."""
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').strftime('%Y/%m/%d')
+    except ValueError:
+        fail(f'{flag} expects YYYY-MM-DD (got {value!r})', fmt)
+
+
+def build_query(args: argparse.Namespace, fmt: str, base: str = '') -> str:
+    """Assemble the Gmail ``q`` string from the flag sugar.
+
+    Every filter is ANDed by juxtaposition, which is what Gmail's query language
+    does with space-separated terms. Pure and offline on purpose: a malformed
+    ``--after`` should fail before we spend a round trip on authentication.
+    """
+    parts: list[str] = []
+    if base:
+        parts.append(base)
+    if getattr(args, 'unread', False):
+        parts.append('is:unread')
+    if getattr(args, 'has_attachments', False):
+        parts.append('has:attachment')
+    if getattr(args, 'sender', None):
+        parts.append(f'from:{args.sender}')
+    if getattr(args, 'to', None):
+        parts.append(f'to:{args.to}')
+    if getattr(args, 'after', None):
+        parts.append(f'after:{gmail_date(args.after, "--after", fmt)}')
+    if getattr(args, 'before', None):
+        parts.append(f'before:{gmail_date(args.before, "--before", fmt)}')
+    return ' '.join(parts).strip()
+
+
+def resolve_label_filter(args: argparse.Namespace, service: Any, fmt: str) -> list[str] | None:
+    if not getattr(args, 'label', None):
+        return None
+    return [resolve_label_id(service, args.label, fmt)]
+
+
+def list_message_ids(
+    service: Any,
+    fmt: str,
+    *,
+    query: str,
+    limit: int,
+    page_token: str | None,
+    label_ids: list[str] | None,
+    include_spam_trash: bool,
+) -> tuple[list[str], str | None]:
+    """Page through ``messages.list`` until ``limit`` ids are collected."""
+    ids: list[str] = []
+    token = page_token
+    while len(ids) < limit:
+        response = execute(
+            service.users()
+            .messages()
+            .list(
+                userId='me',
+                q=query or None,
+                maxResults=min(500, limit - len(ids)),
+                pageToken=token or None,
+                labelIds=label_ids or None,
+                includeSpamTrash=include_spam_trash,
+            ),
+            fmt,
+        )
+        ids.extend(str(m['id']) for m in response.get('messages', []) or [])
+        token = response.get('nextPageToken')
+        if not token:
+            break
+    return ids[:limit], token
+
+
+def fetch_summaries(service: Any, ids: list[str], fmt: str) -> list[dict[str, Any]]:
+    """One ``messages.get`` per id — the API has no bulk metadata fetch."""
+    summaries = []
+    for message_id in ids:
+        msg = execute(
+            service.users()
+            .messages()
+            .get(
+                userId='me',
+                id=message_id,
+                format='metadata',
+                metadataHeaders=_SUMMARY_HEADERS,
+            ),
+            fmt,
+        )
+        summaries.append(message_summary(msg))
+    return summaries
+
+
+def _messages_result(
+    summaries: list[dict[str, Any]], query: str, token: str | None, **extra: Any
+) -> dict[str, Any]:
+    result: dict[str, Any] = {'messages': summaries, 'count': len(summaries), 'query': query}
+    result.update(extra)
+    if token:
+        result['nextPageToken'] = token
+    return result
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -654,6 +848,48 @@ def cmd_labels(args: argparse.Namespace, fmt: str) -> None:
     service = gmail_service(fmt)
     labels = execute(service.users().labels().list(userId='me'), fmt).get('labels', [])
     emit({'labels': labels, 'count': len(labels)}, fmt)
+
+
+def cmd_list(args: argparse.Namespace, fmt: str) -> None:
+    query = build_query(args, fmt)
+    service = gmail_service(fmt)
+    label_ids = resolve_label_filter(args, service, fmt)
+    ids, token = list_message_ids(
+        service,
+        fmt,
+        query=query,
+        limit=args.limit,
+        page_token=args.page_token,
+        label_ids=label_ids,
+        include_spam_trash=args.include_spam_trash,
+    )
+    emit(_messages_result(fetch_summaries(service, ids, fmt), query, token), fmt)
+
+
+def cmd_search(args: argparse.Namespace, fmt: str) -> None:
+    base = args.query or ''
+    if base and args.subject_only:
+        # Wrap before the flag sugar is appended, so `--subject-only --unread`
+        # means subject:(term) AND is:unread, not subject:(term is:unread).
+        base = f'subject:({base})'
+    query = build_query(args, fmt, base=base)
+    if not query and not args.label:
+        fail('Provide a search query or at least one filter', fmt)
+    service = gmail_service(fmt)
+    label_ids = resolve_label_filter(args, service, fmt)
+    ids, token = list_message_ids(
+        service,
+        fmt,
+        query=query,
+        limit=args.limit,
+        page_token=args.page_token,
+        label_ids=label_ids,
+        include_spam_trash=args.include_spam_trash,
+    )
+    emit(
+        _messages_result(fetch_summaries(service, ids, fmt), query, token, searchMethod='gmail_q'),
+        fmt,
+    )
 
 
 def cmd_configure(args: argparse.Namespace, fmt: str) -> None:
@@ -733,7 +969,40 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser('profile', help='Show the authorized account and its message/thread totals.')
     sub.add_parser('labels', help='List all labels with their ids.')
 
+    p_list = sub.add_parser('list', help='List messages, newest first, with optional filters.')
+    _add_filter_args(p_list)
+
+    p_search = sub.add_parser(
+        'search',
+        help='Search with a raw Gmail query (from: subject: has:attachment older_than:1y ...).',
+    )
+    p_search.add_argument('query', nargs='?', metavar='QUERY', help='Raw Gmail search query.')
+    p_search.add_argument(
+        '--subject-only',
+        action='store_true',
+        help='Match QUERY against the subject only (wraps it as subject:(QUERY)).',
+    )
+    _add_filter_args(p_search)
+
     return parser
+
+
+def _add_filter_args(parser: argparse.ArgumentParser) -> None:
+    """Shared query sugar for `list` and `search`. All filters AND together."""
+    parser.add_argument('--limit', type=int, default=25, help='Maximum messages to return (25).')
+    parser.add_argument('--page-token', metavar='TOKEN', help='Continue from a previous page.')
+    parser.add_argument('--unread', action='store_true', help='Only unread messages.')
+    parser.add_argument(
+        '--has-attachments', action='store_true', help='Only messages with attachments.'
+    )
+    parser.add_argument('--from', dest='sender', metavar='ADDR', help='Match the sender.')
+    parser.add_argument('--to', metavar='ADDR', help='Match a recipient.')
+    parser.add_argument('--label', metavar='NAME', help='Restrict to a label, by name.')
+    parser.add_argument('--after', metavar='YYYY-MM-DD', help='On or after this date.')
+    parser.add_argument('--before', metavar='YYYY-MM-DD', help='Before this date.')
+    parser.add_argument(
+        '--include-spam-trash', action='store_true', help='Also search Spam and Trash.'
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -752,6 +1021,8 @@ def main(argv: list[str] | None = None) -> int:
         'logout': cmd_logout,
         'profile': cmd_profile,
         'labels': cmd_labels,
+        'list': cmd_list,
+        'search': cmd_search,
     }
     handler = handlers.get(args.command)
     if handler is None:
