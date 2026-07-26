@@ -217,8 +217,10 @@ def _render_messages(data: dict[str, Any]) -> str:
         marker = '[+]' if msg.get('hasAttachments') else '   '
         sender = msg.get('fromName') or msg.get('fromEmail') or msg.get('from') or ''
         lines.append(
-            f'{marker} {_format_date(msg.get("date", ""))}  '
-            f'{_truncate(str(sender), 30)}  {_truncate(str(msg.get("subject", "")), 60)}'
+            (
+                f'{marker} {_format_date(msg.get("date", ""))}  '
+                f'{_truncate(str(sender), 30)}  {_truncate(str(msg.get("subject", "")), 60)}'
+            ).rstrip()
         )
         lines.append(f'      id: {msg.get("id", "")}')
     if data.get('nextPageToken'):
