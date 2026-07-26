@@ -1143,6 +1143,45 @@ def cmd_attachment(args: argparse.Namespace, fmt: str) -> None:
     emit({'status': 'saved', 'path': str(target), 'size': len(payload)}, fmt)
 
 
+def cmd_history(args: argparse.Namespace, fmt: str) -> None:
+    service = gmail_service(fmt)
+    records: list[dict[str, Any]] = []
+    token = args.page_token
+    latest_history_id = None
+
+    while len(records) < args.limit:
+        response = execute(
+            service.users()
+            .history()
+            .list(
+                userId='me',
+                startHistoryId=args.start_history_id,
+                maxResults=min(500, args.limit - len(records)),
+                pageToken=token or None,
+            ),
+            fmt,
+            not_found=(
+                f'History id {args.start_history_id} is no longer available '
+                '(Gmail keeps roughly a week). Re-sync with: gmail-cli list'
+            ),
+        )
+        latest_history_id = response.get('historyId', latest_history_id)
+        records.extend(response.get('history', []) or [])
+        token = response.get('nextPageToken')
+        if not token:
+            break
+
+    result: dict[str, Any] = {
+        'startHistoryId': args.start_history_id,
+        'historyId': latest_history_id,
+        'history': records[: args.limit],
+        'count': len(records[: args.limit]),
+    }
+    if token:
+        result['nextPageToken'] = token
+    emit(result, fmt)
+
+
 def cmd_configure(args: argparse.Namespace, fmt: str) -> None:
     config = load_config()
     if args.credentials:
@@ -1261,6 +1300,20 @@ def build_parser() -> argparse.ArgumentParser:
         help='Write to PATH. A directory (or trailing /) keeps the sender-supplied filename.',
     )
 
+    p_history = sub.add_parser(
+        'history', help='Replay mailbox changes since a history id (from profile).'
+    )
+    p_history.add_argument(
+        '--start-history-id',
+        required=True,
+        metavar='N',
+        help='History id to start from — take it from `gmail-cli profile`.',
+    )
+    p_history.add_argument(
+        '--limit', type=int, default=100, help='Maximum history records to return (100).'
+    )
+    p_history.add_argument('--page-token', metavar='TOKEN', help='Continue from a previous page.')
+
     return parser
 
 
@@ -1303,6 +1356,7 @@ def main(argv: list[str] | None = None) -> int:
         'read': cmd_read,
         'thread': cmd_thread,
         'attachment': cmd_attachment,
+        'history': cmd_history,
     }
     handler = handlers.get(args.command)
     if handler is None:
