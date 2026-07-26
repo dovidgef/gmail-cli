@@ -16,11 +16,21 @@ import contextlib
 import json
 import os
 import sys
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
 from gmail_cli import __version__
+
+try:
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    _IMPORT_ERROR: str | None = None
+except ImportError as exc:  # pragma: no cover - exercised only on a broken install
+    _IMPORT_ERROR = str(exc)
 
 # The single scope this tool ever requests. Read-only is enforced by Google,
 # not merely by the absence of mutating subcommands.
@@ -267,6 +277,276 @@ def _render_kv(data: dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------
+# OAuth
+# --------------------------------------------------------------------------
+
+_MANUAL_DEFAULT_PORT = 8765
+
+
+def require_google() -> None:
+    """Bail out with an install hint if the Google client libraries are absent."""
+    if _IMPORT_ERROR is not None:
+        print(f'{_INSTALL_HINT} [{_IMPORT_ERROR}]', file=sys.stderr)
+        raise SystemExit(EXIT_ERROR)
+
+
+def require_client_secrets(fmt: str) -> Path:
+    """Return the OAuth client JSON path, or print the setup guide and exit 1."""
+    path = resolve_credentials_path()
+    if not path.is_file():
+        print(_SETUP_GUIDE.format(path=path), file=sys.stderr)
+        fail(f'OAuth client JSON not found: {path}', fmt)
+    return path
+
+
+def load_cached_credentials() -> Credentials | None:
+    path = token_path()
+    if not path.is_file():
+        return None
+    try:
+        return Credentials.from_authorized_user_file(str(path), SCOPES)
+    except (OSError, ValueError):
+        return None
+
+
+def save_credentials(creds: Credentials) -> Path:
+    path = token_path()
+    write_private(path, creds.to_json())
+    return path
+
+
+def get_credentials(fmt: str) -> Credentials:
+    """Load cached credentials, refreshing silently when they have expired."""
+    require_google()
+    creds = load_cached_credentials()
+    if creds is None:
+        fail('Not logged in. Run: gmail-cli login', fmt)
+    if creds.valid:
+        return creds
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as exc:
+            fail(f'Could not refresh the cached token: {exc}. Run: gmail-cli login --force', fmt)
+        save_credentials(creds)
+        return creds
+    fail('Cached credentials are unusable. Run: gmail-cli login --force', fmt)
+
+
+def _new_flow(cred_path: Path, redirect_uri: str | None = None, state: str | None = None) -> Any:
+    kwargs: dict[str, Any] = {}
+    if state:
+        kwargs['state'] = state
+    flow = InstalledAppFlow.from_client_secrets_file(str(cred_path), SCOPES, **kwargs)
+    if redirect_uri:
+        flow.redirect_uri = redirect_uri
+    return flow
+
+
+def _authorization_url(flow: Any) -> tuple[str, str]:
+    """Build the consent URL. ``prompt=consent`` is what makes Google hand back a
+    refresh token, which is what keeps subsequent runs non-interactive."""
+    auth_url, state = flow.authorization_url(
+        access_type='offline',
+        prompt='consent',
+        include_granted_scopes='true',
+    )
+    return str(auth_url), str(state)
+
+
+def _save_manual_state(flow: Any, cred_path: Path, state: str) -> Path:
+    """Persist the PKCE verifier so a second process can finish the exchange."""
+    path = manual_state_path()
+    write_private(
+        path,
+        json.dumps(
+            {
+                'code_verifier': flow.code_verifier,
+                'state': state,
+                'redirect_uri': flow.redirect_uri,
+                'credentials_path': str(cred_path),
+            },
+            indent=2,
+        )
+        + '\n',
+    )
+    return path
+
+
+def _load_manual_state(fmt: str) -> dict[str, Any]:
+    path = manual_state_path()
+    if not path.is_file():
+        fail(
+            'No pending login found. Start one with: gmail-cli login --print-url',
+            fmt,
+            state_path=str(path),
+        )
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        fail(f'Pending-login state is unreadable ({exc}). Re-run: gmail-cli login --print-url', fmt)
+    if not isinstance(data, dict) or not data.get('redirect_uri'):
+        fail('Pending-login state is incomplete. Re-run: gmail-cli login --print-url', fmt)
+    return data
+
+
+def _extract_code(value: str, fmt: str) -> str:
+    """Accept either a bare authorization code or the whole redirect URL.
+
+    The redirect URL is what a user actually has to hand: the browser fails to
+    load ``http://localhost:<port>/?code=...`` because nothing is listening
+    there, but the address bar still holds the code.
+    """
+    value = value.strip()
+    if '://' in value or value.startswith('?'):
+        query = urllib.parse.urlparse(value).query or value.lstrip('?')
+        params = urllib.parse.parse_qs(query)
+        if 'error' in params:
+            description = params.get('error_description', [''])[0]
+            detail = f' — {description}' if description else ''
+            fail(f'Authorization was refused: {params["error"][0]}{detail}', fmt)
+        codes = params.get('code')
+        if not codes or not codes[0]:
+            fail('No ?code= parameter in that URL. Copy the full redirect URL.', fmt)
+        return codes[0]
+    return value
+
+
+def _login_result(creds: Credentials, mode: str) -> dict[str, Any]:
+    return {
+        'status': 'logged_in',
+        'mode': mode,
+        'token_path': str(token_path()),
+        'scopes': SCOPES,
+        'expiry': creds.expiry,
+        'has_refresh_token': bool(creds.refresh_token),
+    }
+
+
+def _finish_with_code(value: str, fmt: str) -> None:
+    """Phase 2 of the two-process flow: exchange the code against saved PKCE state."""
+    state = _load_manual_state(fmt)
+    code = _extract_code(value, fmt)
+    cred_path = Path(str(state.get('credentials_path') or resolve_credentials_path()))
+    if not cred_path.is_file():
+        cred_path = require_client_secrets(fmt)
+
+    flow = _new_flow(cred_path, redirect_uri=str(state['redirect_uri']), state=state.get('state'))
+    flow.code_verifier = state.get('code_verifier')
+    try:
+        # Anything the OAuth stack prints belongs on stderr; stdout is JSON only.
+        with contextlib.redirect_stdout(sys.stderr):
+            flow.fetch_token(code=code)
+    except Exception as exc:
+        fail(f'Token exchange failed: {exc}', fmt)
+
+    creds = flow.credentials
+    save_credentials(creds)
+    manual_state_path().unlink(missing_ok=True)
+    emit(_login_result(creds, 'code'), fmt)
+
+
+def cmd_login(args: argparse.Namespace, fmt: str) -> None:
+    require_google()
+
+    if args.code:
+        _finish_with_code(args.code, fmt)
+        return
+
+    if not args.force:
+        cached = load_cached_credentials()
+        if cached is not None and cached.valid:
+            emit(
+                {
+                    'status': 'already_logged_in',
+                    'token_path': str(token_path()),
+                    'scopes': SCOPES,
+                    'expiry': cached.expiry,
+                    'hint': 'Re-authenticate with: gmail-cli login --force',
+                },
+                fmt,
+            )
+            return
+
+    cred_path = require_client_secrets(fmt)
+
+    if args.print_url:
+        port = args.port or _MANUAL_DEFAULT_PORT
+        flow = _new_flow(cred_path, redirect_uri=f'http://localhost:{port}')
+        auth_url, state = _authorization_url(flow)
+        state_file = _save_manual_state(flow, cred_path, state)
+        emit(
+            {
+                'status': 'url_ready',
+                'auth_url': auth_url,
+                'next': (
+                    'Open the URL, approve access, then copy the localhost URL the '
+                    "browser fails to load (it won't load — nothing is listening there) "
+                    "and run: gmail-cli login --code '<url>'"
+                ),
+                'state_path': str(state_file),
+            },
+            fmt,
+        )
+        return
+
+    if args.manual:
+        port = args.port or _MANUAL_DEFAULT_PORT
+        flow = _new_flow(cred_path, redirect_uri=f'http://localhost:{port}')
+        auth_url, state = _authorization_url(flow)
+        # Persist before prompting: an interrupted run stays resumable with --code.
+        _save_manual_state(flow, cred_path, state)
+        print(f'Open this URL and approve access:\n\n{auth_url}\n', file=sys.stderr)
+        print(
+            'The browser will then fail to load a localhost URL — that is expected.\n'
+            'Paste that whole URL (or just the code) here.',
+            file=sys.stderr,
+        )
+        try:
+            entered = input('code or redirect URL: ')
+        except (EOFError, KeyboardInterrupt):
+            print('', file=sys.stderr)
+            fail(
+                'Login interrupted. Resume with: '
+                "gmail-cli login --code '<url>'  (PKCE state was saved)",
+                fmt,
+            )
+        _finish_with_code(entered, fmt)
+        return
+
+    # Default: spin up a throwaway local server to catch the redirect.
+    flow = _new_flow(cred_path)
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            creds = flow.run_local_server(
+                port=args.port,
+                open_browser=False,
+                bind_addr='localhost',
+                access_type='offline',
+                prompt='consent',
+                include_granted_scopes='true',
+            )
+    except Exception as exc:
+        fail(f'Local-redirect login failed: {exc}', fmt)
+
+    save_credentials(creds)
+    emit(_login_result(creds, 'local_server'), fmt)
+
+
+def cmd_logout(args: argparse.Namespace, fmt: str) -> None:
+    """Delete the cached token. Config, client secrets and PKCE state are left alone.
+
+    This is local-only — it does not revoke the grant server-side. Do that at
+    https://myaccount.google.com/permissions
+    """
+    path = token_path()
+    removed = path.is_file()
+    if removed:
+        path.unlink()
+    emit({'status': 'logged_out', 'cache_removed': removed, 'token_path': str(path)}, fmt)
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -315,6 +595,37 @@ def build_parser() -> argparse.ArgumentParser:
         '--default-format', choices=('json', 'text'), help='Default output format.'
     )
 
+    p_login = sub.add_parser('login', help='Authorize this machine (read-only scope).')
+    p_login.add_argument(
+        '--force', action='store_true', help='Re-authenticate even if a valid token is cached.'
+    )
+    p_login.add_argument(
+        '--port',
+        type=int,
+        default=0,
+        help=(
+            'Redirect port. 0 (default) auto-assigns for the local-server flow; '
+            f'{_MANUAL_DEFAULT_PORT} is used for --manual/--print-url.'
+        ),
+    )
+    p_login.add_argument(
+        '--manual',
+        action='store_true',
+        help='Print the consent URL and wait for the code on stdin (one process).',
+    )
+    p_login.add_argument(
+        '--print-url',
+        action='store_true',
+        help='Print the consent URL and exit; finish later with --code (two processes).',
+    )
+    p_login.add_argument(
+        '--code',
+        metavar='VALUE',
+        help='Finish a --print-url/--manual login. Accepts the code or the whole redirect URL.',
+    )
+
+    sub.add_parser('logout', help='Delete the cached token (does not revoke server-side).')
+
     return parser
 
 
@@ -328,11 +639,16 @@ def main(argv: list[str] | None = None) -> int:
 
     fmt = resolve_format(args.output)
 
-    if args.command == 'configure':
-        cmd_configure(args, fmt)
-        return EXIT_OK
-
-    fail(f'Unknown command: {args.command}', fmt)
+    handlers = {
+        'configure': cmd_configure,
+        'login': cmd_login,
+        'logout': cmd_logout,
+    }
+    handler = handlers.get(args.command)
+    if handler is None:
+        fail(f'Unknown command: {args.command}', fmt)
+    handler(args, fmt)
+    return EXIT_OK
 
 
 if __name__ == '__main__':  # pragma: no cover
