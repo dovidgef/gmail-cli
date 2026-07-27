@@ -60,10 +60,12 @@ No OAuth client found. One-time Google Cloud setup:
 
   1. Open https://console.cloud.google.com/ and create (or pick) a project.
   2. APIs & Services -> Library -> enable "Gmail API".
-  3. APIs & Services -> OAuth consent screen -> External -> add yourself as a
-     test user. Add the scope https://www.googleapis.com/auth/gmail.readonly
-  4. APIs & Services -> Credentials -> Create credentials -> OAuth client ID ->
+  3. Google Auth Platform -> Audience -> External. In "Testing" status add
+     yourself as a test user; "In production" needs no allowlist.
+  4. Google Auth Platform -> Clients -> Create client ->
      Application type: "Desktop app" -> Download JSON.
+     Save it now: Google never shows the client secret again. If you lose it,
+     "Add secret" on the client page is the only recovery.
   5. Save it as {path}
      (or point at it with: gmail-cli configure --credentials /path/to/client.json)
 

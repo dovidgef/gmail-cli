@@ -42,8 +42,8 @@ Google requires your own OAuth client — there is no shared one to borrow.
 
 1. Open <https://console.cloud.google.com/> and create (or pick) a project.
 2. **APIs & Services → Library** → enable **Gmail API**.
-3. **APIs & Services → OAuth consent screen** → *External* → add your own address as a test user, and add the scope `https://www.googleapis.com/auth/gmail.readonly`.
-4. **APIs & Services → Credentials → Create credentials → OAuth client ID** → application type **Desktop app** → download the JSON.
+3. **Google Auth Platform → Audience** → *External*. While publishing status is **Testing** you must add your own address as a test user; **In production** needs no allowlist and any Google account can consent.
+4. **Google Auth Platform → Clients → Create client** → application type **Desktop app** → **Download JSON**.
 5. Save it as `~/.gmail-cli/credentials.json`, or point at it:
 
 ```bash
@@ -51,6 +51,23 @@ gmail-cli configure --credentials ~/Downloads/client_secret_....json
 ```
 
 Running any command without a client JSON prints this same guide to stderr.
+
+> **Download the JSON at creation time — it's your only chance.** Google no longer
+> reveals a client secret after the fact: the detail page shows it masked
+> (`****cXNc`) forever, and there is no "view" or "re-download". If you lose it,
+> the only recovery is **Add secret** on the client's page, which mints a second
+> secret. That new secret is likewise never displayed — but the copy button's
+> `aria-label` carries it, so you can retrieve it from the page if the download
+> itself misbehaves. Disable the stale secret afterwards; the console offers no
+> per-secret delete, only Disable (the `Delete` button removes the whole client).
+
+Application type matters: a **Web application** client pins fixed redirect URIs and
+will fail this tool's loopback flow with `redirect_uri_mismatch`. Desktop clients
+accept any `localhost` port.
+
+`gmail.readonly` is a **restricted** scope, so an unverified consent screen shows
+an "unverified app" interstitial (*Advanced → Go to … (unsafe)*) and caps the
+project at 100 consenting users for its lifetime. Both are fine for personal use.
 
 ## Log in
 
