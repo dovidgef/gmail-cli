@@ -1,0 +1,83 @@
+# Mirrors .pre-commit-config.yaml, so a green local commit means a green CI run.
+# The extra job here is `package`: the wheel force-includes SKILL.md from
+# .claude/, which nothing in the test suite can catch if it breaks.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --group dev --python ${{ matrix.python-version }}
+
+      - name: ruff format
+        run: uv run ruff format --check .
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: mypy
+        run: uv run mypy src/gmail_cli
+
+      - name: pytest
+        run: uv run pytest -q
+
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # The wheel is built from the sdist, so this also proves the sdist is
+      # self-sufficient — a missing file in [tool.hatch.build.targets.sdist]
+      # fails here rather than at someone's `pip install git+...`.
+      - name: Skill is bundled in both artifacts
+        run: |
+          set -euo pipefail
+          python -m zipfile -l dist/*.whl | grep -q 'gmail_cli/_skill/SKILL.md'
+          tar -tzf dist/*.tar.gz | grep -q '\.claude/skills/gmail-cli/SKILL.md'
+
+      # Installs the built wheel the way a user would, then checks the console
+      # script exists and can write the skill back out.
+      - name: Installed tool runs and ships its skill
+        run: |
+          set -euo pipefail
+          uv tool install --force dist/*.whl
+          "$HOME/.local/bin/gmail-cli" --version
+          "$HOME/.local/bin/gmail-cli" install-skill --target "$RUNNER_TEMP/skills"
+          test -s "$RUNNER_TEMP/skills/gmail-cli/SKILL.md"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

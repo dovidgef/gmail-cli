@@ -1,5 +1,7 @@
 # gmail-cli
 
+[![CI](https://github.com/dovidgef/gmail-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/dovidgef/gmail-cli/actions/workflows/ci.yml)
+
 A strictly read-only, JSON-first command-line client for Gmail.
 
 It exists so an AI agent (or a shell script, or you) can search, read and inspect a Gmail account without any ability to change it — and so the one interactive login stays a human's job.
@@ -237,6 +239,11 @@ uv run pre-commit install
 ```
 
 Tests are fully offline and need no credentials. The network paths, the three OAuth flows, pagination, `attachment --save` and the text renderer are verified by hand.
+
+CI runs the same four checks on Python 3.10–3.13, plus a packaging job that
+builds both artifacts, asserts `SKILL.md` is inside each, installs the wheel and
+writes the skill back out — the `force-include` that bundles it is invisible to
+the test suite otherwise.
 
 ## License
 
