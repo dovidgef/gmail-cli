@@ -102,4 +102,5 @@ Every failure is a JSON object with an `error` key, never a traceback. Common on
 - **Cost.** A listing is roughly one request per message returned. `--limit 25` is cheap; `--limit 500` is ~500 requests and will hit rate limits. Narrow with a query rather than raising the limit.
 - **Dates are UTC.** Emitted `date` fields are ISO-8601 UTC, but Gmail's `after:`/`before:` filter on its own internal date in the account's timezone — a message right at midnight can look a day off.
 - **Snippets are HTML-escaped** as Gmail returns them (`&#39;`), so unescape before quoting them back to the user.
+- **Attachment ids expire.** Gmail regenerates `attachmentId` on each `read`, so fetch the id and download in the same breath rather than reusing one from earlier in the conversation.
 - **Don't dump whole mailboxes into context.** Pull the summary, answer the question, and fetch bodies on demand.

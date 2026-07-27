@@ -644,8 +644,26 @@ def resolve_label_id(service: Any, name: str, fmt: str) -> str:
 # Message shaping
 # --------------------------------------------------------------------------
 
-# Enough for a summary line plus attachment detection at format=metadata.
-_SUMMARY_HEADERS = ['From', 'To', 'Cc', 'Subject', 'Date', 'Content-Disposition']
+# Summaries are fetched at format=full with a partial-response mask rather than
+# format=metadata. This is not an optimization — it is a correctness fix:
+# format=metadata returns NO `parts` array at all, so attachment detection is
+# simply impossible there (Gmail reports the message as multipart/mixed and
+# stops). The mask below asks for the part tree but deliberately omits
+# `body/data`, so no message body crosses the wire: ~8 KB per message, the same
+# one `messages.get` per id, and attachment detection identical to `read`.
+#
+# Part nesting is enumerated to four levels because the `fields` syntax has no
+# recursion; four covers mixed > related > alternative > leaf, which is deeper
+# than mail in the wild goes.
+_PART_FIELDS = 'filename,mimeType,body/attachmentId'
+_PARTS_MASK = _PART_FIELDS
+for _ in range(3):
+    _PARTS_MASK = f'{_PART_FIELDS},parts({_PARTS_MASK})'
+_MESSAGE_FIELDS = (
+    'id,threadId,labelIds,snippet,internalDate,'
+    f'payload/mimeType,payload/headers,payload/parts({_PARTS_MASK})'
+)
+_THREAD_FIELDS = f'id,historyId,messages({_MESSAGE_FIELDS})'
 
 
 def headers_map(payload: dict[str, Any]) -> dict[str, str]:
@@ -688,21 +706,18 @@ def iso_from_internal_date(value: Any) -> str:
         return ''
 
 
-def metadata_has_attachments(payload: dict[str, Any]) -> bool:
-    """Walk a ``format=metadata`` MIME tree looking for an attachment part.
+def payload_has_attachments(payload: dict[str, Any]) -> bool:
+    """True when the MIME tree carries at least one attachment part.
 
-    Metadata format omits ``body.attachmentId``, so the only signals available
-    are a non-empty ``filename`` and a ``Content-Disposition: attachment``
-    header. ``read`` at ``format=full`` remains authoritative.
+    Deliberately delegates to ``collect_parts`` so a summary and a ``read`` of
+    the same message can never disagree about what counts as an attachment.
     """
     if not isinstance(payload, dict):
         return False
-    if payload.get('filename'):
-        return True
-    disposition = headers_map(payload).get('content-disposition', '')
-    if disposition.strip().lower().startswith('attachment'):
-        return True
-    return any(metadata_has_attachments(part) for part in payload.get('parts') or [])
+    texts: list[tuple[str, str]] = []
+    attachments: list[dict[str, Any]] = []
+    collect_parts(payload, texts, attachments)
+    return bool(attachments)
 
 
 def message_summary(msg: dict[str, Any]) -> dict[str, Any]:
@@ -721,7 +736,7 @@ def message_summary(msg: dict[str, Any]) -> dict[str, Any]:
         'cc': split_addresses(headers.get('cc', '')),
         'date': iso_from_internal_date(msg.get('internalDate')),
         'labelIds': msg.get('labelIds', []),
-        'hasAttachments': metadata_has_attachments(payload),
+        'hasAttachments': payload_has_attachments(payload),
         'snippet': msg.get('snippet', ''),
     }
 
@@ -917,8 +932,8 @@ def fetch_summaries(service: Any, ids: list[str], fmt: str) -> list[dict[str, An
             .get(
                 userId='me',
                 id=message_id,
-                format='metadata',
-                metadataHeaders=_SUMMARY_HEADERS,
+                format='full',
+                fields=_MESSAGE_FIELDS,
             ),
             fmt,
         )
@@ -1065,8 +1080,8 @@ def cmd_thread(args: argparse.Namespace, fmt: str) -> None:
         .get(
             userId='me',
             id=args.thread_id,
-            format='metadata',
-            metadataHeaders=_SUMMARY_HEADERS,
+            format='full',
+            fields=_THREAD_FIELDS,
         ),
         fmt,
         not_found=f'No such thread: {args.thread_id}',
@@ -1093,8 +1108,17 @@ def sanitize_filename(name: str) -> str:
     return '' if candidate in ('', '.', '..') else candidate
 
 
-def attachment_filename(service: Any, message_id: str, attachment_id: str, fmt: str) -> str:
-    """Look up the part's real filename. Costs one extra ``messages.get``."""
+def attachment_filename(
+    service: Any, message_id: str, attachment_id: str, fmt: str, size: int | None = None
+) -> str:
+    """Look up the part's real filename. Costs one extra ``messages.get``.
+
+    Matching on the attachment id alone is not enough: Gmail mints a fresh
+    ``attachmentId`` on every ``messages.get``, so the id the caller holds
+    usually will not appear in a re-fetched tree even though it downloads fine.
+    Fall back to the byte size (which is stable), then to "there is only one
+    attachment anyway". Ambiguity yields '' and the caller names the file by id.
+    """
     msg = execute(
         service.users().messages().get(userId='me', id=message_id, format='full'),
         fmt,
@@ -1103,9 +1127,18 @@ def attachment_filename(service: Any, message_id: str, attachment_id: str, fmt: 
     texts: list[tuple[str, str]] = []
     attachments: list[dict[str, Any]] = []
     collect_parts(msg.get('payload') or {}, texts, attachments)
+
     for att in attachments:
         if str(att.get('id')) == attachment_id:
             return sanitize_filename(str(att.get('name') or ''))
+
+    if size is not None:
+        matches = [a for a in attachments if a.get('size') == size]
+        if len(matches) == 1:
+            return sanitize_filename(str(matches[0].get('name') or ''))
+
+    if len(attachments) == 1:
+        return sanitize_filename(str(attachments[0].get('name') or ''))
     return ''
 
 
@@ -1138,7 +1171,9 @@ def cmd_attachment(args: argparse.Namespace, fmt: str) -> None:
 
     target = Path(args.save).expanduser()
     if target.is_dir() or args.save.endswith(('/', os.sep)):
-        name = attachment_filename(service, args.message_id, args.attachment_id, fmt)
+        name = attachment_filename(
+            service, args.message_id, args.attachment_id, fmt, size=len(payload)
+        )
         target = target / (name or f'attachment_{args.attachment_id[:12]}')
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

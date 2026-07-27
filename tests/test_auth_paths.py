@@ -138,25 +138,72 @@ class HeaderTests(unittest.TestCase):
 
 
 class AttachmentDetectionTests(unittest.TestCase):
-    def test_metadata_filename_marks_attachment(self) -> None:
-        payload = {'parts': [{'mimeType': 'application/pdf', 'filename': 'invoice.pdf'}]}
-        self.assertTrue(cli.metadata_has_attachments(payload))
+    """Detection runs on a format=full part tree.
 
-    def test_metadata_content_disposition_marks_attachment(self) -> None:
+    format=metadata is NOT usable for this: Gmail returns no `parts` array at
+    all there, so summaries are fetched at format=full behind a fields mask.
+    """
+
+    def test_attachment_part_detected(self) -> None:
         payload = {
+            'mimeType': 'multipart/mixed',
             'parts': [
                 {
-                    'mimeType': 'application/octet-stream',
-                    'filename': '',
-                    'headers': [{'name': 'Content-Disposition', 'value': 'attachment'}],
+                    'mimeType': 'application/pdf',
+                    'filename': 'invoice.pdf',
+                    'body': {'attachmentId': 'ATT1', 'size': 900},
                 }
-            ]
+            ],
         }
-        self.assertTrue(cli.metadata_has_attachments(payload))
+        self.assertTrue(cli.payload_has_attachments(payload))
+
+    def test_nested_attachment_detected(self) -> None:
+        payload = {
+            'mimeType': 'multipart/mixed',
+            'parts': [
+                {
+                    'mimeType': 'multipart/related',
+                    'parts': [
+                        {
+                            'mimeType': 'image/png',
+                            'filename': 'logo.png',
+                            'body': {'attachmentId': 'ATT2', 'size': 10},
+                        }
+                    ],
+                }
+            ],
+        }
+        self.assertTrue(cli.payload_has_attachments(payload))
 
     def test_plain_message_has_none(self) -> None:
         payload = {'mimeType': 'text/plain', 'filename': '', 'body': {'data': _b64('hi')}}
-        self.assertFalse(cli.metadata_has_attachments(payload))
+        self.assertFalse(cli.payload_has_attachments(payload))
+
+    def test_filename_without_attachment_id_is_not_one(self) -> None:
+        # A body part can carry a name without being a real attachment.
+        payload = {
+            'mimeType': 'multipart/alternative',
+            'parts': [{'mimeType': 'text/plain', 'filename': 'note', 'body': {'data': _b64('x')}}],
+        }
+        self.assertFalse(cli.payload_has_attachments(payload))
+
+    def test_summary_and_read_agree(self) -> None:
+        payload = {
+            'mimeType': 'multipart/mixed',
+            'parts': [
+                {'mimeType': 'text/plain', 'filename': '', 'body': {'data': _b64('body')}},
+                {
+                    'mimeType': 'application/pdf',
+                    'filename': 'a.pdf',
+                    'body': {'attachmentId': 'A', 'size': 5},
+                },
+            ],
+        }
+        msg = {'id': 'm', 'payload': payload}
+        summary = cli.message_summary(msg)
+        full = cli.message_full(msg, 'text', False)
+        self.assertEqual(summary['hasAttachments'], full['hasAttachments'])
+        self.assertTrue(summary['hasAttachments'])
 
     def test_full_format_attachment_is_not_body(self) -> None:
         payload = {
@@ -182,6 +229,67 @@ class AttachmentDetectionTests(unittest.TestCase):
         self.assertEqual(cli.sanitize_filename('../../etc/passwd'), 'passwd')
         self.assertEqual(cli.sanitize_filename('report.pdf'), 'report.pdf')
         self.assertEqual(cli.sanitize_filename('..'), '')
+
+
+class _FakeService:
+    """Minimal stand-in for the Gmail client: users().messages().get().execute()."""
+
+    def __init__(self, message: dict[str, object]) -> None:
+        self._message = message
+
+    def users(self) -> _FakeService:
+        return self
+
+    def messages(self) -> _FakeService:
+        return self
+
+    def get(self, **_kwargs: object) -> _FakeService:
+        return self
+
+    def execute(self) -> dict[str, object]:
+        return self._message
+
+
+def _message_with(attachments: list[tuple[str, str, int]]) -> dict[str, object]:
+    return {
+        'id': 'm',
+        'payload': {
+            'mimeType': 'multipart/mixed',
+            'parts': [
+                {
+                    'mimeType': 'application/pdf',
+                    'filename': name,
+                    'body': {'attachmentId': aid, 'size': size},
+                }
+                for name, aid, size in attachments
+            ],
+        },
+    }
+
+
+class AttachmentFilenameTests(unittest.TestCase):
+    """Gmail mints a fresh attachmentId per messages.get, so id matching alone fails."""
+
+    def test_exact_id_match(self) -> None:
+        svc = _FakeService(_message_with([('a.pdf', 'LIVE', 10), ('b.pdf', 'OTHER', 20)]))
+        self.assertEqual(cli.attachment_filename(svc, 'm', 'LIVE', 'json'), 'a.pdf')
+
+    def test_stale_id_falls_back_to_size(self) -> None:
+        svc = _FakeService(_message_with([('a.pdf', 'REGEN1', 10), ('b.pdf', 'REGEN2', 20)]))
+        self.assertEqual(cli.attachment_filename(svc, 'm', 'STALE', 'json', size=20), 'b.pdf')
+
+    def test_stale_id_single_attachment(self) -> None:
+        svc = _FakeService(_message_with([('only.pdf', 'REGEN', 10)]))
+        self.assertEqual(cli.attachment_filename(svc, 'm', 'STALE', 'json'), 'only.pdf')
+
+    def test_ambiguous_returns_empty(self) -> None:
+        # Two same-sized attachments and a stale id: refuse to guess.
+        svc = _FakeService(_message_with([('a.pdf', 'R1', 10), ('b.pdf', 'R2', 10)]))
+        self.assertEqual(cli.attachment_filename(svc, 'm', 'STALE', 'json', size=10), '')
+
+    def test_derived_name_is_sanitized(self) -> None:
+        svc = _FakeService(_message_with([('../../evil.pdf', 'LIVE', 10)]))
+        self.assertEqual(cli.attachment_filename(svc, 'm', 'LIVE', 'json'), 'evil.pdf')
 
 
 class BodySelectionTests(unittest.TestCase):

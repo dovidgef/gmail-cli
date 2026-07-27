@@ -210,7 +210,8 @@ Narrow with a query rather than raising `--limit`. Requests are retried with exp
 
 - **Timezones.** Emitted `date` fields are ISO-8601 **UTC**, but Gmail's `after:`/`before:` filter against its own internal date in the *account's* timezone. A message near midnight can therefore look a day off relative to the filter that matched it.
 - **Snippets are HTML-escaped**, exactly as Gmail returns them (`&#39;`).
-- **`hasAttachments` in listings** is inferred from the `format=metadata` MIME tree (a non-empty `filename` or `Content-Disposition: attachment`), because metadata format omits `body.attachmentId`. `read` at `format=full` is authoritative.
+- **Attachment ids are ephemeral.** Gmail mints a fresh `attachmentId` on every `messages.get`, so an id from an old `read` may not appear in a later fetch. Take the id from `read` and use it promptly; `attachment --save` into a directory still recovers the correct filename by falling back to byte size when the id has rotated.
+- **Summaries cost a masked `format=full` fetch, not `format=metadata`.** Gmail returns no `parts` array whatsoever at `format=metadata`, which makes attachment detection impossible there. Listings therefore request `format=full` behind a `fields` mask that omits `body/data` — same one request per message, ~8 KB each, and `hasAttachments` agrees exactly with `read`.
 - **`history`** only reaches back about a week; older sync points return an error telling you to re-list.
 
 ## Claude Code skill
