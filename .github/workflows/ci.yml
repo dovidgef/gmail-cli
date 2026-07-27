@@ -60,11 +60,19 @@ jobs:
       # The wheel is built from the sdist, so this also proves the sdist is
       # self-sufficient — a missing file in [tool.hatch.build.targets.sdist]
       # fails here rather than at someone's `pip install git+...`.
+      # Listings go to files rather than straight into `grep -q`: grep exits at
+      # the first match, the producer takes SIGPIPE, and `pipefail` reports that
+      # as a failure even though the assertion passed. Files also mean the full
+      # listing is in the log when something really is missing.
       - name: Skill is bundled in both artifacts
         run: |
           set -euo pipefail
-          python -m zipfile -l dist/*.whl | grep -q 'gmail_cli/_skill/SKILL.md'
-          tar -tzf dist/*.tar.gz | grep -q '\.claude/skills/gmail-cli/SKILL.md'
+          python -m zipfile -l dist/*.whl > wheel-listing.txt
+          tar -tzf dist/*.tar.gz > sdist-listing.txt
+          grep -F 'gmail_cli/_skill/SKILL.md' wheel-listing.txt \
+            || { echo '::error::SKILL.md missing from the wheel'; cat wheel-listing.txt; exit 1; }
+          grep -F '.claude/skills/gmail-cli/SKILL.md' sdist-listing.txt \
+            || { echo '::error::SKILL.md missing from the sdist'; cat sdist-listing.txt; exit 1; }
 
       # Installs the built wheel the way a user would, then checks the console
       # script exists and can write the skill back out.
