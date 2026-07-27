@@ -1,13 +1,13 @@
 ---
 name: gmail-cli
-description: Search and read a real Gmail mailbox from the shell via `gmail-cli` — find an email, check the inbox, look up what someone sent, pull a thread, download an attachment, dig out a receipt/invoice/booking/confirmation code. Use this whenever `gmail-cli` is installed and the task involves the user's own email. Triggers on phrases like "check my email", "search my inbox", "did X email me", "find the email about Y", "what did <person> say", "any unread mail", "pull up that receipt", "forward me the details from", "when did <company> email me", "get the attachment from that email", "read message <id>", "show the thread". It is strictly READ-ONLY — it holds only the gmail.readonly scope, so it can never send, reply, label, archive, trash or delete; say so plainly rather than attempting a workaround. If `gmail-cli` is not installed, tell the user `uv tool install gmail-cli` (or `pipx install gmail-cli` / `pip install gmail-cli`) and carry on with this skill once it is.
+description: Search and read a real Gmail mailbox from the shell via `gmail-cli` — find an email, check the inbox, look up what someone sent, pull a thread, download an attachment, dig out a receipt/invoice/booking/confirmation code. Use this whenever `gmail-cli` is installed and the task involves the user's own email. Triggers on phrases like "check my email", "search my inbox", "did X email me", "find the email about Y", "what did <person> say", "any unread mail", "pull up that receipt", "forward me the details from", "when did <company> email me", "get the attachment from that email", "read message <id>", "show the thread". It is strictly READ-ONLY — it holds only the gmail.readonly scope, so it can never send, reply, label, archive, trash or delete; say so plainly rather than attempting a workaround. If `gmail-cli` is not installed, tell the user to install it from its git repo — never `uv tool install gmail-cli`, because an unrelated PyPI package owns that name and is a mail *sender*.
 ---
 
 # gmail-cli
 
 A strictly read-only Gmail client with a stable JSON-on-stdout contract. Built so an agent can query a mailbox the same way it would use `jq` or `gh`.
 
-**Check it's installed:** `command -v gmail-cli` — if absent, ask the user to `uv tool install gmail-cli`.
+**Check it's installed:** `command -v gmail-cli` — if absent, ask the user to install it **from its git repo** (`uv tool install git+https://github.com/dovidgef/gmail-cli.git`). Never suggest `uv tool install gmail-cli`: that name on PyPI belongs to an unrelated *sending* tool, it installs cleanly, and it would silently break every read-only guarantee below.
 
 ## The read-only boundary
 

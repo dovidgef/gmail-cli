@@ -49,10 +49,14 @@ EXIT_ERROR = 1
 
 _STATE_DIR_NAME = '.gmail-cli'
 _SKILL_NAME = 'gmail-cli'
+# Deliberately the git URL, not a bare package name: PyPI's `gmail-cli` is an
+# unrelated mail *sender* that installs cleanly, so a vague "reinstall the tool"
+# would send people straight to a binary with none of this one's guarantees.
+_REPO_URL = 'git+https://github.com/dovidgef/gmail-cli.git'
 _INSTALL_HINT = (
-    'Missing dependencies. Install with: '
-    'uv tool install gmail-cli  (or: pip install google-auth google-auth-oauthlib '
-    'google-api-python-client)'
+    'Missing dependencies. Reinstall this tool with: '
+    f'uv tool install --force {_REPO_URL}  (or repair the environment directly: '
+    'pip install google-auth google-auth-oauthlib google-api-python-client)'
 )
 
 _SETUP_GUIDE = """\
@@ -1249,7 +1253,7 @@ def cmd_install_skill(args: argparse.Namespace, fmt: str) -> None:
     if text is None:
         fail(
             'SKILL.md is not present in this install. Reinstall with: '
-            'uv tool install --force gmail-cli',
+            f'uv tool install --force {_REPO_URL}',
             fmt,
         )
 

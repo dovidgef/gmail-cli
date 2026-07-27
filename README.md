@@ -25,12 +25,23 @@ To revoke access entirely, remove the app at <https://myaccount.google.com/permi
 ## Install
 
 ```bash
-uv tool install gmail-cli        # -> ~/.local/bin/gmail-cli, no sudo, no venv juggling
+uv tool install git+https://github.com/dovidgef/gmail-cli.git
 ```
 
-`pipx install gmail-cli` and `pip install gmail-cli` work too. Python 3.10+.
+That lands `gmail-cli` in `~/.local/bin` — no sudo, no venv juggling — and the
+wheel carries the Claude Code skill with it, so there is nothing to clone.
+Python 3.10+. `pipx install git+https://github.com/dovidgef/gmail-cli.git` and
+the `pip install git+…` equivalent work the same way.
 
-From a clone:
+> ### Do not `uv tool install gmail-cli`
+>
+> This project is **not on PyPI**. The `gmail-cli` name there is already taken by
+> an unrelated project that *sends* mail through the Gmail API. It installs
+> cleanly and puts a `gmail-cli` binary on your PATH, so getting the wrong one is
+> silent — you would end up with a tool that can send mail while every read-only
+> guarantee on this page still appears to apply. Always install from the git URL.
+
+Contributors, from a clone:
 
 ```bash
 uv tool install .
@@ -54,7 +65,7 @@ Running any command without a client JSON prints this same guide to stderr.
 
 > **Download the JSON at creation time — it's your only chance.** Google no longer
 > reveals a client secret after the fact: the detail page shows it masked
-> (`****cXNc`) forever, and there is no "view" or "re-download". If you lose it,
+> (`****abcd`) forever, and there is no "view" or "re-download". If you lose it,
 > the only recovery is **Add secret** on the client's page, which mints a second
 > secret. That new secret is likewise never displayed — but the copy button's
 > `aria-label` carries it, so you can retrieve it from the page if the download

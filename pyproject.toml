@@ -42,9 +42,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/dovidgefen/gmail-cli"
-Repository = "https://github.com/dovidgefen/gmail-cli"
-Issues = "https://github.com/dovidgefen/gmail-cli/issues"
+Homepage = "https://github.com/dovidgef/gmail-cli"
+Repository = "https://github.com/dovidgef/gmail-cli"
+Issues = "https://github.com/dovidgef/gmail-cli/issues"
 
 [project.scripts]
 gmail-cli = "gmail_cli.cli:main"

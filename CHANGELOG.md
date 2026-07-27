@@ -6,7 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] — 2026-07-27
 
-First release.
+First release. Everything below ships in it; nothing was published before this,
+so there is no upgrade path to describe.
+
+### Install
+
+- **Distributed from git, never from PyPI.**
+
+  ```bash
+  uv tool install git+https://github.com/dovidgef/gmail-cli.git
+  ```
+
+  The `gmail-cli` name on PyPI is owned by an unrelated project that *sends*
+  mail through the Gmail API. It installs cleanly and puts a `gmail-cli` binary
+  on `PATH`, so `uv tool install gmail-cli` fails silently in the worst way: you
+  get a working command with none of this project's read-only guarantees, while
+  the docs and the bundled agent skill still promise them. Every install
+  instruction — README, `SKILL.md`, the missing-dependency hint and the
+  `install-skill` repair hint — names the git URL explicitly and warns off the
+  PyPI package. If this project ever goes to PyPI it will need a different
+  distribution name; the console script can stay `gmail-cli`.
 
 ### Added
 
@@ -41,4 +60,4 @@ First release.
 - Offline test suite covering path resolution, the scope, base64url decoding,
   header and address parsing, attachment detection and body selection.
 
-[0.1.0]: https://github.com/dovidgefen/gmail-cli/releases/tag/v0.1.0
+[0.1.0]: https://github.com/dovidgef/gmail-cli/releases/tag/v0.1.0
