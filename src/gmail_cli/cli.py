@@ -1282,17 +1282,34 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='Output format (default: json, or config.default_format).',
     )
+    # The same flag is offered again on every subcommand, so both
+    # `gmail-cli -o text profile` and `gmail-cli profile -o text` work. SUPPRESS
+    # is what makes that safe: when the subcommand doesn't carry the flag it
+    # leaves the namespace alone instead of overwriting the global value.
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        '--output',
+        '-o',
+        dest='output',
+        choices=('json', 'text'),
+        default=argparse.SUPPRESS,
+        help='Output format (default: json, or config.default_format).',
+    )
+
     sub = parser.add_subparsers(dest='command', metavar='COMMAND')
+    sub_kwargs: dict[str, Any] = {'parents': [shared]}
 
     p_configure = sub.add_parser(
-        'configure', help='Set credentials path and default output format.'
+        'configure', help='Set credentials path and default output format.', **sub_kwargs
     )
     p_configure.add_argument('--credentials', metavar='PATH', help='Path to the OAuth client JSON.')
     p_configure.add_argument(
         '--default-format', choices=('json', 'text'), help='Default output format.'
     )
 
-    p_login = sub.add_parser('login', help='Authorize this machine (read-only scope).')
+    p_login = sub.add_parser(
+        'login', help='Authorize this machine (read-only scope).', **sub_kwargs
+    )
     p_login.add_argument(
         '--force', action='store_true', help='Re-authenticate even if a valid token is cached.'
     )
@@ -1321,16 +1338,25 @@ def build_parser() -> argparse.ArgumentParser:
         help='Finish a --print-url/--manual login. Accepts the code or the whole redirect URL.',
     )
 
-    sub.add_parser('logout', help='Delete the cached token (does not revoke server-side).')
-    sub.add_parser('profile', help='Show the authorized account and its message/thread totals.')
-    sub.add_parser('labels', help='List all labels with their ids.')
+    sub.add_parser(
+        'logout', help='Delete the cached token (does not revoke server-side).', **sub_kwargs
+    )
+    sub.add_parser(
+        'profile',
+        help='Show the authorized account and its message/thread totals.',
+        **sub_kwargs,
+    )
+    sub.add_parser('labels', help='List all labels with their ids.', **sub_kwargs)
 
-    p_list = sub.add_parser('list', help='List messages, newest first, with optional filters.')
+    p_list = sub.add_parser(
+        'list', help='List messages, newest first, with optional filters.', **sub_kwargs
+    )
     _add_filter_args(p_list)
 
     p_search = sub.add_parser(
         'search',
         help='Search with a raw Gmail query (from: subject: has:attachment older_than:1y ...).',
+        **sub_kwargs,
     )
     p_search.add_argument('query', nargs='?', metavar='QUERY', help='Raw Gmail search query.')
     p_search.add_argument(
@@ -1340,7 +1366,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_filter_args(p_search)
 
-    p_read = sub.add_parser('read', help='Read one message, body included.')
+    p_read = sub.add_parser('read', help='Read one message, body included.', **sub_kwargs)
     p_read.add_argument('message_id', metavar='MESSAGE_ID')
     p_read.add_argument(
         '--body-type',
@@ -1354,10 +1380,12 @@ def build_parser() -> argparse.ArgumentParser:
         '--save-eml', metavar='PATH', help='Write the RFC822 source to PATH (or PATH/<id>.eml).'
     )
 
-    p_thread = sub.add_parser('thread', help='Summarize every message in a thread.')
+    p_thread = sub.add_parser('thread', help='Summarize every message in a thread.', **sub_kwargs)
     p_thread.add_argument('thread_id', metavar='THREAD_ID')
 
-    p_attachment = sub.add_parser('attachment', help='Inspect or download an attachment.')
+    p_attachment = sub.add_parser(
+        'attachment', help='Inspect or download an attachment.', **sub_kwargs
+    )
     p_attachment.add_argument('message_id', metavar='MSG_ID')
     p_attachment.add_argument('attachment_id', metavar='ATT_ID')
     p_attachment.add_argument(
@@ -1367,7 +1395,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_history = sub.add_parser(
-        'history', help='Replay mailbox changes since a history id (from profile).'
+        'history',
+        help='Replay mailbox changes since a history id (from profile).',
+        **sub_kwargs,
     )
     p_history.add_argument(
         '--start-history-id',
@@ -1381,7 +1411,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_history.add_argument('--page-token', metavar='TOKEN', help='Continue from a previous page.')
 
     p_skill = sub.add_parser(
-        'install-skill', help='Write the bundled Claude Code skill into a skills directory.'
+        'install-skill',
+        help='Write the bundled Claude Code skill into a skills directory.',
+        **sub_kwargs,
     )
     p_skill.add_argument(
         '--scope',

@@ -208,6 +208,27 @@ class BodySelectionTests(unittest.TestCase):
         self.assertEqual(cli.select_body(chunks, 'text'), ('text', 'one\ntwo'))
 
 
+class ParserTests(unittest.TestCase):
+    """--output is accepted before OR after the subcommand."""
+
+    def test_global_position(self) -> None:
+        args = cli.build_parser().parse_args(['-o', 'text', 'profile'])
+        self.assertEqual(args.output, 'text')
+
+    def test_subcommand_position(self) -> None:
+        args = cli.build_parser().parse_args(['profile', '-o', 'text'])
+        self.assertEqual(args.output, 'text')
+
+    def test_unset_stays_none(self) -> None:
+        # None (not a literal 'json') so config.default_format can still win.
+        args = cli.build_parser().parse_args(['profile'])
+        self.assertIsNone(args.output)
+
+    def test_subcommand_flag_does_not_clobber_global(self) -> None:
+        args = cli.build_parser().parse_args(['-o', 'text', 'list'])
+        self.assertEqual(args.output, 'text')
+
+
 class QueryTests(unittest.TestCase):
     def test_flags_and_together(self) -> None:
         args = argparse.Namespace(
