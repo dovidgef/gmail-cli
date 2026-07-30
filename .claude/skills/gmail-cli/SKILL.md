@@ -1,6 +1,6 @@
 ---
 name: gmail-cli
-description: Search and read a real Gmail mailbox from the shell via `gmail-cli` — find an email, check the inbox, look up what someone sent, pull a thread, download an attachment, dig out a receipt/invoice/booking/confirmation code. Use this whenever `gmail-cli` is installed and the task involves the user's own email. Triggers on phrases like "check my email", "search my inbox", "did X email me", "find the email about Y", "what did <person> say", "any unread mail", "pull up that receipt", "forward me the details from", "when did <company> email me", "get the attachment from that email", "read message <id>", "show the thread". It is strictly READ-ONLY — it holds only the gmail.readonly scope, so it can never send, reply, label, archive, trash or delete; say so plainly rather than attempting a workaround. If `gmail-cli` is not installed, tell the user to install it from its git repo — never `uv tool install gmail-cli`, because an unrelated PyPI package owns that name and is a mail *sender*.
+description: Search and read the user's own Gmail mailbox via `gmail-cli` — find emails, pull threads, download attachments, dig out receipts and confirmation codes. Triggers on phrases like "check my email", "did X email me", "find the email about Y". Strictly READ-ONLY (gmail.readonly scope) — it can never send, reply, label, archive, or delete.
 ---
 
 # gmail-cli
@@ -11,7 +11,7 @@ A strictly read-only Gmail client with a stable JSON-on-stdout contract. Built s
 
 ## The read-only boundary
 
-`gmail-cli` requests exactly one OAuth scope: `https://www.googleapis.com/auth/gmail.readonly`. Google itself rejects every mutating call, so there is no flag, no subcommand and no workaround that sends mail, marks something read, applies a label, or deletes anything. If the user asks for one of those, say the tool can't do it — don't reach for `curl`, a Python script, or another mail path unless they explicitly ask you to.
+`gmail-cli` requests exactly one OAuth scope: `https://www.googleapis.com/auth/gmail.readonly`.
 
 ## Bootstrap (once per machine, needs a human)
 
