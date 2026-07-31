@@ -88,7 +88,26 @@ def state_dir() -> Path:
 
 
 def token_path() -> Path:
+    """The pre-multi-account token location, kept as the fallback when no
+    account is configured so existing installs keep working untouched."""
     return state_dir() / 'token_cache.json'
+
+
+def accounts_dir() -> Path:
+    return state_dir() / 'accounts'
+
+
+def account_token_path(name: str) -> Path:
+    return accounts_dir() / f'{name}.json'
+
+
+def resolve_token_path(account: str | None) -> Path:
+    return account_token_path(account) if account else token_path()
+
+
+def list_account_names() -> list[str]:
+    """Saved account names — one ``accounts/<email>.json`` per login."""
+    return sorted(path.stem for path in accounts_dir().glob('*.json'))
 
 
 def config_path() -> Path:
@@ -205,6 +224,10 @@ def render_text(data: Any) -> str:
     if not isinstance(data, dict):
         return f'{data}\n'
 
+    # 'count' distinguishes the `accounts` listing from `logout --all`, which
+    # also carries an 'accounts' key (as plain strings).
+    if isinstance(data.get('accounts'), list) and 'count' in data:
+        return _render_accounts(data)
     if 'messages' in data and isinstance(data['messages'], list):
         return _render_messages(data)
     if 'body' in data and 'subject' in data:
@@ -273,6 +296,16 @@ def _render_labels(data: dict[str, Any]) -> str:
     return '\n'.join(lines) + '\n'
 
 
+def _render_accounts(data: dict[str, Any]) -> str:
+    lines = [f'--- {data.get("count", 0)} account(s) ---']
+    for account in data['accounts']:
+        marker = '*' if account.get('active') else ' '
+        lines.append(f'{marker} {account.get("account", "")}')
+    if data.get('legacyToken'):
+        lines.append(f'legacy token (no account configured): {data["legacyToken"]}')
+    return '\n'.join(lines) + '\n'
+
+
 def _render_profile(data: dict[str, Any]) -> str:
     return (
         f'Email:    {data.get("emailAddress", "")}\n'
@@ -316,8 +349,46 @@ def require_client_secrets(fmt: str) -> Path:
     return path
 
 
-def load_cached_credentials() -> Credentials | None:
-    path = token_path()
+def account_matches(requested: str) -> list[str]:
+    """Saved names matching ``requested``: an exact email, else every
+    case-insensitive substring hit."""
+    names = list_account_names()
+    if requested in names:
+        return [requested]
+    return [name for name in names if requested.lower() in name.lower()]
+
+
+def match_account(requested: str, fmt: str) -> str:
+    """Resolve ``requested`` to exactly one saved account, or exit 1.
+
+    A unique substring is enough (``--account dovid``); an ambiguous fragment
+    fails with the candidates rather than guessing.
+    """
+    names = list_account_names()
+    if not names:
+        fail('No saved accounts. Run: gmail-cli login', fmt)
+    matches = account_matches(requested)
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        fail(f'Ambiguous account: {requested}', fmt, matches=matches)
+    fail(f'Unknown account: {requested}', fmt, accounts=names)
+
+
+def resolve_account(explicit: str | None, fmt: str) -> str | None:
+    """Pick the account to act as.
+
+    Precedence: ``--account`` -> ``$GMAIL_CLI_ACCOUNT`` -> ``config.json:account``.
+    ``None`` means nothing is configured and the legacy ``token_cache.json``
+    is used — the state every pre-multi-account install is in.
+    """
+    requested = explicit or os.environ.get('GMAIL_CLI_ACCOUNT') or load_config().get('account')
+    if not requested:
+        return None
+    return match_account(str(requested), fmt)
+
+
+def load_cached_credentials(path: Path) -> Credentials | None:
     if not path.is_file():
         return None
     try:
@@ -326,18 +397,16 @@ def load_cached_credentials() -> Credentials | None:
         return None
 
 
-def save_credentials(creds: Credentials) -> Path:
-    path = token_path()
-    write_private(path, creds.to_json())
-    return path
-
-
-def get_credentials(fmt: str) -> Credentials:
-    """Load cached credentials, refreshing silently when they have expired."""
+def get_credentials(fmt: str, account: str | None = None) -> Credentials:
+    """Load cached credentials for the selected account, refreshing silently
+    when they have expired. Refreshes write back to the file they came from."""
     require_google()
-    creds = load_cached_credentials()
+    name = resolve_account(account, fmt)
+    path = resolve_token_path(name)
+    creds = load_cached_credentials(path)
     if creds is None:
-        fail('Not logged in. Run: gmail-cli login', fmt)
+        suffix = f' as {name}' if name else ''
+        fail(f'Not logged in{suffix}. Run: gmail-cli login', fmt)
     if creds.valid:
         return creds
     if creds.expired and creds.refresh_token:
@@ -345,7 +414,7 @@ def get_credentials(fmt: str) -> Credentials:
             creds.refresh(Request())
         except Exception as exc:
             fail(f'Could not refresh the cached token: {exc}. Run: gmail-cli login --force', fmt)
-        save_credentials(creds)
+        write_private(path, creds.to_json())
         return creds
     fail('Cached credentials are unusable. Run: gmail-cli login --force', fmt)
 
@@ -429,15 +498,74 @@ def _extract_code(value: str, fmt: str) -> str:
     return value
 
 
-def _login_result(creds: Credentials, mode: str) -> dict[str, Any]:
+def _login_result(creds: Credentials, mode: str, account: str) -> dict[str, Any]:
     return {
         'status': 'logged_in',
         'mode': mode,
-        'token_path': str(token_path()),
+        'account': account,
+        'token_path': str(account_token_path(account)),
         'scopes': SCOPES,
         'expiry': creds.expiry,
         'has_refresh_token': bool(creds.refresh_token),
     }
+
+
+def _profile_email(creds: Credentials) -> str:
+    """The address these credentials belong to — one ``getProfile`` round trip."""
+    service = build_service('gmail', 'v1', credentials=creds, cache_discovery=False)
+    profile = service.users().getProfile(userId='me').execute()
+    return str(profile.get('emailAddress') or '')
+
+
+def _migrate_legacy_token() -> str | None:
+    """Best-effort move of a pre-multi-account ``token_cache.json`` into ``accounts/``.
+
+    Takes one ``getProfile`` to learn which address the old token belongs to.
+    Any failure (revoked token, network) leaves the file where it was — it
+    still works as the fallback for runs with no account configured.
+    """
+    creds = load_cached_credentials(token_path())
+    if creds is None:
+        return None
+    try:
+        if not creds.valid:
+            if not (creds.expired and creds.refresh_token):
+                return None
+            creds.refresh(Request())
+        email = _profile_email(creds)
+    except Exception:
+        return None
+    if not email:
+        return None
+    write_private(account_token_path(email), creds.to_json())
+    token_path().unlink(missing_ok=True)
+    return email
+
+
+def _register_login(creds: Credentials, fmt: str, mode: str) -> None:
+    """Save a fresh login under its own email and make it the active account.
+
+    Whichever account the user picked in Google's chooser lands in its own
+    slot, so logging in again can add a second account but never clobber a
+    different one.
+    """
+    migrated = _migrate_legacy_token()
+    try:
+        email = _profile_email(creds)
+    except Exception as exc:
+        fail(
+            f'Login succeeded but the account email could not be determined: {exc}. Try again.', fmt
+        )
+    if not email:
+        fail('Login succeeded but Gmail returned no email address. Try again.', fmt)
+    write_private(account_token_path(email), creds.to_json())
+    config = load_config()
+    config['account'] = email
+    save_config(config)
+    result = _login_result(creds, mode, email)
+    if migrated and migrated != email:
+        result['migrated'] = migrated
+    emit(result, fmt)
 
 
 def _finish_with_code(value: str, fmt: str) -> None:
@@ -458,9 +586,8 @@ def _finish_with_code(value: str, fmt: str) -> None:
         fail(f'Token exchange failed: {exc}', fmt)
 
     creds = flow.credentials
-    save_credentials(creds)
     manual_state_path().unlink(missing_ok=True)
-    emit(_login_result(creds, 'code'), fmt)
+    _register_login(creds, fmt, 'code')
 
 
 def cmd_login(args: argparse.Namespace, fmt: str) -> None:
@@ -471,18 +598,23 @@ def cmd_login(args: argparse.Namespace, fmt: str) -> None:
         return
 
     if not args.force:
-        cached = load_cached_credentials()
+        name = resolve_account(getattr(args, 'account', None), fmt)
+        cached = load_cached_credentials(resolve_token_path(name))
         if cached is not None and cached.valid:
-            emit(
+            payload: dict[str, Any] = {'status': 'already_logged_in'}
+            if name:
+                payload['account'] = name
+            payload.update(
                 {
-                    'status': 'already_logged_in',
-                    'token_path': str(token_path()),
+                    'token_path': str(resolve_token_path(name)),
                     'scopes': SCOPES,
                     'expiry': cached.expiry,
-                    'hint': 'Re-authenticate with: gmail-cli login --force',
-                },
-                fmt,
+                    'hint': (
+                        'Re-authenticate (or add another account) with: gmail-cli login --force'
+                    ),
+                }
             )
+            emit(payload, fmt)
             return
 
     cred_path = require_client_secrets(fmt)
@@ -546,21 +678,71 @@ def cmd_login(args: argparse.Namespace, fmt: str) -> None:
     except Exception as exc:
         fail(f'Local-redirect login failed: {exc}', fmt)
 
-    save_credentials(creds)
-    emit(_login_result(creds, 'local_server'), fmt)
+    _register_login(creds, fmt, 'local_server')
 
 
 def cmd_logout(args: argparse.Namespace, fmt: str) -> None:
-    """Delete the cached token. Config, client secrets and PKCE state are left alone.
+    """Delete cached tokens. Config, client secrets and PKCE state are left alone.
 
     This is local-only — it does not revoke the grant server-side. Do that at
     https://myaccount.google.com/permissions
     """
-    path = token_path()
+    config = load_config()
+    if getattr(args, 'all', False):
+        names = list_account_names()
+        for saved in names:
+            account_token_path(saved).unlink(missing_ok=True)
+        legacy = token_path().is_file()
+        token_path().unlink(missing_ok=True)
+        if config.pop('account', None) is not None:
+            save_config(config)
+        emit({'status': 'logged_out', 'accounts': names, 'legacy_cache_removed': legacy}, fmt)
+        return
+
+    name = resolve_account(getattr(args, 'account', None), fmt)
+    path = resolve_token_path(name)
     removed = path.is_file()
     if removed:
         path.unlink()
-    emit({'status': 'logged_out', 'cache_removed': removed, 'token_path': str(path)}, fmt)
+    if name is not None and config.get('account') == name:
+        config.pop('account')
+        save_config(config)
+    payload: dict[str, Any] = {'status': 'logged_out'}
+    if name:
+        payload['account'] = name
+    payload.update({'cache_removed': removed, 'token_path': str(path)})
+    emit(payload, fmt)
+
+
+def cmd_accounts(args: argparse.Namespace, fmt: str) -> None:
+    """List saved accounts. Purely local — no network, no token refresh."""
+    names = list_account_names()
+    requested = os.environ.get('GMAIL_CLI_ACCOUNT') or load_config().get('account')
+    active = None
+    if requested:
+        matches = account_matches(str(requested))
+        if len(matches) == 1:
+            active = matches[0]
+    accounts = [
+        {'account': name, 'active': name == active, 'tokenPath': str(account_token_path(name))}
+        for name in names
+    ]
+    result: dict[str, Any] = {'accounts': accounts, 'count': len(accounts)}
+    if active:
+        result['active'] = active
+    if token_path().is_file():
+        # A pre-multi-account token; consulted only when no account is configured.
+        result['legacyToken'] = str(token_path())
+    emit(result, fmt)
+
+
+def cmd_switch(args: argparse.Namespace, fmt: str) -> None:
+    """Set the active account in config. Per-invocation override stays --account."""
+    name = match_account(args.account_name, fmt)
+    config = load_config()
+    config['account'] = name
+    save_config(config)
+    emit({'status': 'switched', 'account': name, 'tokenPath': str(account_token_path(name))}, fmt)
 
 
 # --------------------------------------------------------------------------
@@ -572,8 +754,8 @@ _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _RETRY_REASONS = frozenset({'rateLimitExceeded', 'userRateLimitExceeded'})
 
 
-def gmail_service(fmt: str) -> Any:
-    creds = get_credentials(fmt)
+def gmail_service(fmt: str, account: str | None = None) -> Any:
+    creds = get_credentials(fmt, account)
     return build_service('gmail', 'v1', credentials=creds, cache_discovery=False)
 
 
@@ -961,7 +1143,7 @@ def _messages_result(
 
 
 def cmd_profile(args: argparse.Namespace, fmt: str) -> None:
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     profile = execute(service.users().getProfile(userId='me'), fmt)
     emit(
         {
@@ -975,14 +1157,14 @@ def cmd_profile(args: argparse.Namespace, fmt: str) -> None:
 
 
 def cmd_labels(args: argparse.Namespace, fmt: str) -> None:
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     labels = execute(service.users().labels().list(userId='me'), fmt).get('labels', [])
     emit({'labels': labels, 'count': len(labels)}, fmt)
 
 
 def cmd_list(args: argparse.Namespace, fmt: str) -> None:
     query = build_query(args, fmt)
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     label_ids = resolve_label_filter(args, service, fmt)
     ids, token = list_message_ids(
         service,
@@ -1005,7 +1187,7 @@ def cmd_search(args: argparse.Namespace, fmt: str) -> None:
     query = build_query(args, fmt, base=base)
     if not query and not args.label:
         fail('Provide a search query or at least one filter', fmt)
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     label_ids = resolve_label_filter(args, service, fmt)
     ids, token = list_message_ids(
         service,
@@ -1023,7 +1205,7 @@ def cmd_search(args: argparse.Namespace, fmt: str) -> None:
 
 
 def cmd_read(args: argparse.Namespace, fmt: str) -> None:
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     missing = f'No such message: {args.message_id}'
 
     if args.raw or args.save_eml:
@@ -1077,7 +1259,7 @@ def cmd_read(args: argparse.Namespace, fmt: str) -> None:
 
 
 def cmd_thread(args: argparse.Namespace, fmt: str) -> None:
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     thread = execute(
         service.users()
         .threads()
@@ -1147,7 +1329,7 @@ def attachment_filename(
 
 
 def cmd_attachment(args: argparse.Namespace, fmt: str) -> None:
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     att = execute(
         service.users()
         .messages()
@@ -1189,7 +1371,7 @@ def cmd_attachment(args: argparse.Namespace, fmt: str) -> None:
 
 
 def cmd_history(args: argparse.Namespace, fmt: str) -> None:
-    service = gmail_service(fmt)
+    service = gmail_service(fmt, getattr(args, 'account', None))
     records: list[dict[str, Any]] = []
     token = args.page_token
     latest_history_id = None
@@ -1323,7 +1505,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='Output format (default: json, or config.default_format).',
     )
-    # The same flag is offered again on every subcommand, so both
+    parser.add_argument(
+        '--account',
+        metavar='NAME',
+        default=None,
+        help='Act as this saved account: an email or unique substring (default: the active one).',
+    )
+    # The same flags are offered again on every subcommand, so both
     # `gmail-cli -o text profile` and `gmail-cli profile -o text` work. SUPPRESS
     # is what makes that safe: when the subcommand doesn't carry the flag it
     # leaves the namespace alone instead of overwriting the global value.
@@ -1335,6 +1523,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=('json', 'text'),
         default=argparse.SUPPRESS,
         help='Output format (default: json, or config.default_format).',
+    )
+    shared.add_argument(
+        '--account',
+        dest='account',
+        metavar='NAME',
+        default=argparse.SUPPRESS,
+        help='Act as this saved account: an email or unique substring (default: the active one).',
     )
 
     sub = parser.add_subparsers(dest='command', metavar='COMMAND')
@@ -1352,7 +1547,9 @@ def build_parser() -> argparse.ArgumentParser:
         'login', help='Authorize this machine (read-only scope).', **sub_kwargs
     )
     p_login.add_argument(
-        '--force', action='store_true', help='Re-authenticate even if a valid token is cached.'
+        '--force',
+        action='store_true',
+        help='Run the flow even if a valid token is cached: re-authenticate or add another account.',
     )
     p_login.add_argument(
         '--port',
@@ -1379,9 +1576,22 @@ def build_parser() -> argparse.ArgumentParser:
         help='Finish a --print-url/--manual login. Accepts the code or the whole redirect URL.',
     )
 
-    sub.add_parser(
-        'logout', help='Delete the cached token (does not revoke server-side).', **sub_kwargs
+    p_logout = sub.add_parser(
+        'logout',
+        help='Delete the active (or given) account token (does not revoke server-side).',
+        **sub_kwargs,
     )
+    p_logout.add_argument('--all', action='store_true', help='Remove every saved account token.')
+
+    sub.add_parser('accounts', help='List saved accounts; the active one is marked.', **sub_kwargs)
+
+    p_switch = sub.add_parser('switch', help='Set the active account.', **sub_kwargs)
+    p_switch.add_argument(
+        'account_name',
+        metavar='ACCOUNT',
+        help='A saved account email; a unique substring is enough.',
+    )
+
     sub.add_parser(
         'profile',
         help='Show the authorized account and its message/thread totals.',
@@ -1506,6 +1716,8 @@ def main(argv: list[str] | None = None) -> int:
         'configure': cmd_configure,
         'login': cmd_login,
         'logout': cmd_logout,
+        'accounts': cmd_accounts,
+        'switch': cmd_switch,
         'profile': cmd_profile,
         'labels': cmd_labels,
         'list': cmd_list,

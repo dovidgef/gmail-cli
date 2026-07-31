@@ -27,6 +27,18 @@ The redirect page failing to load is expected — nothing is listening on that p
 
 If they have no OAuth client yet, `gmail-cli login` prints a five-step Google Cloud setup guide to stderr. `gmail-cli profile` confirms who is authorized.
 
+## Accounts
+
+Each login is saved under its own email; several accounts can be logged in at once. Adding one is the same human hand-off: the user runs `gmail-cli login --force` and picks the other account in Google's chooser — it can never clobber an existing account's token.
+
+```bash
+gmail-cli accounts                  # saved accounts, active one marked — local, costs nothing
+gmail-cli switch <NAME>             # set the active account
+gmail-cli --account <NAME> <cmd>    # act as another account for one command, any command
+```
+
+`<NAME>` is the email or any unique substring of it (`switch dovid`); an ambiguous fragment errors with the candidates. Prefer `--account` over `switch` when the user asks about a specific mailbox — it leaves their active account alone. `logout` removes the active (or `--account`-selected) token; `logout --all` removes every one.
+
 ## Commands
 
 ```bash

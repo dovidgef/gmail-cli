@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gmail-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Strictly read-only, JSON-first command-line client for Gmail — search, read and inspect mail from a terminal or an AI agent."
 readme = "README.md"
 requires-python = ">=3.10"

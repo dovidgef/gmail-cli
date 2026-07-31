@@ -102,14 +102,31 @@ gmail-cli login --code 'http://localhost:8765/?code=4/0AVMB...&scope=...'
 
 `gmail-cli login --manual` is the same thing in one process: it prints the URL and waits on stdin. It persists the PKCE state *before* prompting, so an interrupted run is still resumable with `--code`.
 
-Subsequent runs refresh the token silently. `gmail-cli login` on a valid token reports `already_logged_in` and does nothing; use `--force` to re-authenticate.
+Subsequent runs refresh the token silently. `gmail-cli login` on a valid token reports `already_logged_in` and does nothing; use `--force` to run the flow anyway — to re-authenticate, or to add another account.
+
+## Accounts
+
+Each login is saved under the address it belongs to (learned with one `getProfile` call) at `~/.gmail-cli/accounts/<email>.json` and becomes the **active** account. Logging in again (`login --force`) and picking a different account in Google's chooser adds a second slot — it can never clobber a different account's token.
+
+```bash
+gmail-cli accounts                     # list saved accounts; the active one is marked
+gmail-cli switch other@gmail.com       # set the active account (a unique substring works: `switch other`)
+gmail-cli --account work profile       # per-invocation override, on any command
+gmail-cli logout                       # remove the active account's token; --all removes every one
+```
+
+Account selection precedence: `--account` → `$GMAIL_CLI_ACCOUNT` → `config.json:account`. `--account` takes the email or any unique substring of it; an ambiguous fragment errors with the candidates instead of guessing.
+
+Installs that predate multi-account keep working untouched: the old `~/.gmail-cli/token_cache.json` remains the fallback whenever no account is configured, and the next successful `login` migrates it into `accounts/` automatically (reported as `"migrated"` in the login output).
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `configure` | Set `credentials_path` and `default_format` |
-| `login` / `logout` | Authorize this machine / delete the local token cache |
+| `login` / `logout` | Authorize an account / delete its local token (`logout --all` removes every one) |
+| `accounts` | List saved accounts; the active one is marked |
+| `switch ACCOUNT` | Set the active account |
 | `profile` | Authorized address, message and thread totals, current `historyId` |
 | `labels` | Every label with its id |
 | `list` | List messages, newest first, with filter flags |
@@ -120,7 +137,7 @@ Subsequent runs refresh the token silently. `gmail-cli login` on a valid token r
 | `history --start-history-id N` | Mailbox changes since a sync point |
 | `install-skill` | Write the bundled Claude Code skill into a skills directory |
 
-Global: `--output/-o {json,text}`, `--version`. Bare `gmail-cli` prints help and exits 0.
+Global: `--output/-o {json,text}`, `--account NAME`, `--version`. Bare `gmail-cli` prints help and exits 0.
 
 ### Filters (`list` and `search`)
 
@@ -185,7 +202,7 @@ Errors are `{"error": "…"}` on stdout with exit 1 — never a traceback.
 | Exit | Condition |
 |---|---|
 | 0 | success (including bare invocation, which prints help) |
-| 1 | missing libraries · no OAuth client JSON · not logged in or unrefreshable · empty search query · invalid date · unknown label · 404 · manual-flow error · API error after retries |
+| 1 | missing libraries · no OAuth client JSON · not logged in or unrefreshable · unknown or ambiguous account · empty search query · invalid date · unknown label · 404 · manual-flow error · API error after retries |
 | 2 | usage error (unknown flag or subcommand) |
 
 ## State on disk (`~/.gmail-cli/`)
@@ -193,11 +210,12 @@ Errors are `{"error": "…"}` on stdout with exit 1 — never a traceback.
 | File | Written by | Mode |
 |---|---|---|
 | `credentials.json` | you (downloaded from Google Cloud) | — |
-| `token_cache.json` | `login` | 0600 |
-| `config.json` | `configure` | default |
+| `accounts/<email>.json` | `login` (one per account) | 0600 |
+| `token_cache.json` | pre-0.2 `login`; fallback when no account is configured | 0600 |
+| `config.json` | `configure`, `switch`, `login` | default |
 | `manual-flow-state.json` | `login --print-url` / `--manual` | 0600, deleted after exchange |
 
-Credentials resolution: `$GMAIL_CLI_CREDENTIALS` → `config.json:credentials_path` → `~/.gmail-cli/credentials.json`. That environment variable is the only one consulted. No secret is ever written to stdout.
+Credentials resolution: `$GMAIL_CLI_CREDENTIALS` → `config.json:credentials_path` → `~/.gmail-cli/credentials.json`. Account resolution: `--account` → `$GMAIL_CLI_ACCOUNT` → `config.json:account`. Those two environment variables are the only ones consulted. No secret is ever written to stdout.
 
 ## API cost
 

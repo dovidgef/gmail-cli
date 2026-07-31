@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-07-31
+
+### Added
+
+- **Multiple accounts.** Every successful login is now saved under the address
+  it belongs to — learned with one `getProfile` round trip — at
+  `~/.gmail-cli/accounts/<email>.json`, and becomes the active account. Running
+  `login --force` again and picking a different account in Google's chooser
+  adds a slot; it can never clobber a different account's token.
+- **`accounts`** lists saved accounts (purely local — no network, no refresh)
+  with the active one marked. **`switch ACCOUNT`** sets the active account.
+  Both accept the email or a unique substring of it; an ambiguous fragment
+  fails with the candidates instead of guessing.
+- **`--account NAME`** global flag, valid before or after the subcommand like
+  `--output`, plus **`$GMAIL_CLI_ACCOUNT`**, for per-invocation overrides.
+  Precedence: flag → env var → `config.json:account` → legacy token.
+- **`logout --all`** removes every saved token. Plain `logout` now removes the
+  active (or `--account`-selected) account's token and clears it from config.
+
+### Changed
+
+- `login` output gains `account` (and `migrated`, when a legacy token was
+  moved); `token_path` points into `accounts/`. The `already_logged_in` hint
+  mentions adding another account with `--force`.
+- Token refreshes write back to the account file they were loaded from.
+- The legacy `~/.gmail-cli/token_cache.json` keeps working as the fallback
+  whenever no account is configured, so pre-0.2 installs behave identically
+  until the next successful `login` — which migrates the old token into
+  `accounts/` automatically (best-effort; a revoked or expired one is left
+  in place).
+
 ## [0.1.0] — 2026-07-27
 
 First release. Everything below ships in it; nothing was published before this,
@@ -60,4 +91,5 @@ so there is no upgrade path to describe.
 - Offline test suite covering path resolution, the scope, base64url decoding,
   header and address parsing, attachment detection and body selection.
 
+[0.2.0]: https://github.com/dovidgef/gmail-cli/releases/tag/v0.2.0
 [0.1.0]: https://github.com/dovidgef/gmail-cli/releases/tag/v0.1.0

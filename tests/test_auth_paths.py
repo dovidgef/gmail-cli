@@ -81,6 +81,84 @@ class PathTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
+class AccountTests(unittest.TestCase):
+    """Multi-account resolution is offline: names come from accounts/*.json files."""
+
+    def test_account_paths_live_under_home(self) -> None:
+        with mock.patch.object(Path, 'home', return_value=Path('/home/tester')):
+            self.assertEqual(cli.accounts_dir(), Path('/home/tester/.gmail-cli/accounts'))
+            self.assertEqual(
+                cli.account_token_path('a@x.com'),
+                Path('/home/tester/.gmail-cli/accounts/a@x.com.json'),
+            )
+            self.assertEqual(cli.resolve_token_path('a@x.com'), cli.account_token_path('a@x.com'))
+            # No account selected -> the legacy single-token path.
+            self.assertEqual(cli.resolve_token_path(None), cli.token_path())
+
+    def test_names_come_from_token_files(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(Path, 'home', return_value=Path(tmp)),
+        ):
+            self.assertEqual(cli.list_account_names(), [])
+            cli.write_private(cli.account_token_path('b@y.com'), '{}')
+            cli.write_private(cli.account_token_path('a@x.com'), '{}')
+            self.assertEqual(cli.list_account_names(), ['a@x.com', 'b@y.com'])
+
+    def test_resolution_precedence_flag_env_config(self) -> None:
+        names = ['a@x.com', 'b@y.com']
+        with (
+            mock.patch.object(cli, 'list_account_names', return_value=names),
+            mock.patch.dict('os.environ', {'GMAIL_CLI_ACCOUNT': 'b@y.com'}),
+            mock.patch.object(cli, 'load_config', return_value={'account': 'a@x.com'}),
+        ):
+            self.assertEqual(cli.resolve_account('a@x.com', 'json'), 'a@x.com')  # flag wins
+            self.assertEqual(cli.resolve_account(None, 'json'), 'b@y.com')  # env beats config
+        with (
+            mock.patch.object(cli, 'list_account_names', return_value=names),
+            mock.patch.dict('os.environ', {}, clear=True),
+            mock.patch.object(cli, 'load_config', return_value={'account': 'a@x.com'}),
+        ):
+            self.assertEqual(cli.resolve_account(None, 'json'), 'a@x.com')  # config
+
+    def test_nothing_configured_means_legacy(self) -> None:
+        with (
+            mock.patch.dict('os.environ', {}, clear=True),
+            mock.patch.object(cli, 'load_config', return_value={}),
+        ):
+            self.assertIsNone(cli.resolve_account(None, 'json'))
+
+    def test_unique_substring_matches(self) -> None:
+        names = ['dovidgef@gmail.com', 'work@peletech.dev']
+        with mock.patch.object(cli, 'list_account_names', return_value=names):
+            self.assertEqual(cli.match_account('dovid', 'json'), 'dovidgef@gmail.com')
+
+    def test_exact_name_beats_substring_ambiguity(self) -> None:
+        # 'a@x.com' is a substring of both names; the exact match must win.
+        with mock.patch.object(cli, 'list_account_names', return_value=['a@x.com', 'xa@x.com']):
+            self.assertEqual(cli.match_account('a@x.com', 'json'), 'a@x.com')
+
+    def test_ambiguous_substring_fails(self) -> None:
+        with mock.patch.object(
+            cli, 'list_account_names', return_value=['a@gmail.com', 'b@gmail.com']
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                cli.match_account('gmail', 'json')
+            self.assertEqual(caught.exception.code, cli.EXIT_ERROR)
+
+    def test_unknown_account_fails(self) -> None:
+        with mock.patch.object(cli, 'list_account_names', return_value=['a@x.com']):
+            with self.assertRaises(SystemExit) as caught:
+                cli.match_account('nope', 'json')
+            self.assertEqual(caught.exception.code, cli.EXIT_ERROR)
+
+    def test_no_saved_accounts_fails(self) -> None:
+        with mock.patch.object(cli, 'list_account_names', return_value=[]):
+            with self.assertRaises(SystemExit) as caught:
+                cli.match_account('anything', 'json')
+            self.assertEqual(caught.exception.code, cli.EXIT_ERROR)
+
+
 class Base64Tests(unittest.TestCase):
     def test_decodes_without_padding(self) -> None:
         # Gmail strips '='; a naive b64decode would raise on these.
@@ -335,6 +413,27 @@ class ParserTests(unittest.TestCase):
     def test_subcommand_flag_does_not_clobber_global(self) -> None:
         args = cli.build_parser().parse_args(['-o', 'text', 'list'])
         self.assertEqual(args.output, 'text')
+
+    def test_account_flag_both_positions(self) -> None:
+        args = cli.build_parser().parse_args(['--account', 'x', 'profile'])
+        self.assertEqual(args.account, 'x')
+        args = cli.build_parser().parse_args(['profile', '--account', 'x'])
+        self.assertEqual(args.account, 'x')
+        args = cli.build_parser().parse_args(['profile'])
+        self.assertIsNone(args.account)
+
+    def test_accounts_and_switch_parse(self) -> None:
+        args = cli.build_parser().parse_args(['accounts'])
+        self.assertEqual(args.command, 'accounts')
+        args = cli.build_parser().parse_args(['switch', 'dovid'])
+        self.assertEqual(args.command, 'switch')
+        self.assertEqual(args.account_name, 'dovid')
+
+    def test_logout_all(self) -> None:
+        args = cli.build_parser().parse_args(['logout', '--all'])
+        self.assertTrue(args.all)
+        args = cli.build_parser().parse_args(['logout'])
+        self.assertFalse(args.all)
 
 
 class QueryTests(unittest.TestCase):
